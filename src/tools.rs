@@ -158,14 +158,102 @@ fn call(name: &str, key: &str, value: &str) -> RawCall {
     }
 }
 
+const ASIDES: &[&str] = &[
+    "source",
+    "link",
+    "url",
+    "cite",
+    "citation",
+    "reference",
+    "be brief",
+    "be concise",
+    "short answer",
+    "one sentence",
+    "in one line",
+    "bullet",
+];
+const LEADS: &[&str] = &[
+    "please ",
+    "can you ",
+    "could you ",
+    "search the web for ",
+    "search the web:",
+    "search the web ",
+    "search for ",
+    "search ",
+    "look up ",
+    "find out ",
+    "google ",
+    "tell me ",
+];
+
+pub fn query(text: &str) -> String {
+    let kept: Vec<&str> = text
+        .split_inclusive(['.', '?', '!', '\n'])
+        .map(str::trim)
+        .filter(|s| {
+            let l = s.to_lowercase();
+            !s.is_empty() && !ASIDES.iter().any(|a| l.contains(a))
+        })
+        .collect();
+    let mut q = if kept.is_empty() {
+        text.trim().to_string()
+    } else {
+        kept.join(" ")
+    };
+    loop {
+        let l = q.to_lowercase();
+        match LEADS.iter().find(|p| l.starts_with(*p)) {
+            Some(p) => q = q[p.len()..].trim_start().to_string(),
+            None => break,
+        }
+    }
+    let q: Vec<&str> = q.split_whitespace().take(16).collect();
+    q.join(" ")
+        .trim_end_matches(['.', '?', '!', ':'])
+        .to_string()
+}
+
+fn host(url: &str) -> Option<(&str, &str)> {
+    let rest = url.split_once("://")?.1;
+    let (h, path) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((h.trim_start_matches("www."), path))
+}
+
+fn content_page(url: &str) -> bool {
+    const PORTALS: &[&str] = &[
+        "google.",
+        "bing.",
+        "yahoo.",
+        "duckduckgo.",
+        "startpage.",
+        "mojeek.",
+        "search.",
+        "yandex.",
+        "baidu.",
+        "ask.com",
+        "qwant.",
+        "brave.com",
+    ];
+    host(url).is_some_and(|(h, path)| {
+        let path = path.trim_end_matches('/');
+        !path.is_empty()
+            && !path.starts_with('?')
+            && !PORTALS
+                .iter()
+                .any(|p| h.starts_with(p) || h.contains(&format!(".{p}")))
+    })
+}
+
 pub fn plan(text: &str, offered: &[&Tool], search: bool) -> Vec<RawCall> {
     let has = |n: &str| offered.iter().any(|t| t.name == n);
     let urls = links(text, READ_AHEAD);
     if !urls.is_empty() && has("read_page") {
         return urls.iter().map(|u| call("read_page", "url", u)).collect();
     }
-    if search && has("web_search") && text.split_whitespace().count() >= 3 {
-        return vec![call("web_search", "query", text.trim())];
+    let q = query(text);
+    if search && has("web_search") && q.split_whitespace().count() >= 2 {
+        return vec![call("web_search", "query", &q)];
     }
     Vec::new()
 }
@@ -174,10 +262,22 @@ pub fn follow(done: &RawCall, out: &str, offered: &[&Tool]) -> Vec<RawCall> {
     if done.name != "web_search" || !offered.iter().any(|t| t.name == "read_page") {
         return Vec::new();
     }
-    links(out, READ_AHEAD)
-        .iter()
-        .map(|u| call("read_page", "url", u))
-        .collect()
+    let mut seen: Vec<&str> = Vec::new();
+    let mut calls = Vec::new();
+    for block in out.split("\n\n") {
+        let Some(url) = block.lines().nth(1).map(str::trim) else {
+            continue;
+        };
+        let Some((h, _)) = host(url) else { continue };
+        if content_page(url) && !seen.contains(&h) {
+            seen.push(h);
+            calls.push(call("read_page", "url", url));
+            if calls.len() >= READ_AHEAD {
+                break;
+            }
+        }
+    }
+    calls
 }
 
 impl Tool {
@@ -658,6 +758,24 @@ mod tests {
     }
 
     #[test]
+    fn derives_search_queries() {
+        assert_eq!(
+            query("Search the web: what is the latest stable NixOS release? Give the source link."),
+            "what is the latest stable NixOS release"
+        );
+        assert_eq!(
+            query("Please look up bitcoin price today"),
+            "bitcoin price today"
+        );
+        assert_eq!(
+            query(
+                "Find a CRM under $99 a month for a small team and say what reviews say about it."
+            ),
+            "Find a CRM under $99 a month for a small team and say what reviews say"
+        );
+    }
+
+    #[test]
     fn plans_reads_and_searches() {
         let offered: Vec<&Tool> = ["web_search", "read_page"]
             .iter()
@@ -679,10 +797,23 @@ mod tests {
         let done = call("web_search", "query", "q");
         let f = follow(
             &done,
-            "A\nhttps://a.example/1\ns\n\nB\nhttps://b.example/2\ns\n\nC\nhttps://c.example/3",
+            "A\nhttps://a.example/1\ns\n\nB\nhttps://a.example/2\ns\n\nC\nhttps://c.example/3",
             &offered,
         );
         assert_eq!(f.len(), 2);
+        assert_eq!(f[1].args["url"], "https://c.example/3");
+        let portals = follow(
+            &done,
+            "G\nhttps://www.google.com/\ns\n\nY\nhttps://search.yahoo.com/?q=x\ns\n\nN\nhttps://nixos.org/blog/announcements/2026/nixos-2605/\ns",
+            &offered,
+        );
+        assert_eq!(portals.len(), 1);
+        assert!(
+            portals[0].args["url"]
+                .as_str()
+                .unwrap()
+                .contains("nixos-2605")
+        );
         assert!(follow(&done, "https://a.example/1", &offered[..1]).is_empty());
     }
 

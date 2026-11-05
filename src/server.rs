@@ -33,6 +33,7 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .merge(crate::uhp::router(app.clone()))
         .route("/health", get(health))
+        .route("/", get(ui))
         .with_state(app)
 }
 
@@ -116,6 +117,20 @@ async fn health(State(app): S, headers: HeaderMap) -> Json<Value> {
     Json(
         json!({"ok": true, "engine": "nexy-engine", "version": env!("CARGO_PKG_VERSION"),
         "model": app.backend.model, "caps": caps, "bots": app.bots.keys().collect::<Vec<_>>(), "slots": app.cfg.slots}),
+    )
+}
+
+async fn ui() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            (
+                "content-security-policy",
+                "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+            ),
+            ("x-frame-options", "DENY"),
+        ],
+        include_str!("ui.html"),
     )
 }
 

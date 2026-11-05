@@ -91,6 +91,42 @@ fn call_from(v: &Value) -> Option<RawCall> {
     Some(RawCall { name, args })
 }
 
+fn bare_call(text: &str) -> Option<RawCall> {
+    let t = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_matches('`')
+        .trim();
+    let start = if t.starts_with('{') {
+        0
+    } else {
+        t.find("\n{")? + 1
+    };
+    let v: Value = serde_json::from_str(t[start..].trim()).ok()?;
+    let shaped = v["name"].is_string()
+        && ["parameters", "arguments", "args"]
+            .iter()
+            .any(|k| v.get(*k).is_some());
+    if shaped { call_from(&v) } else { None }
+}
+
+fn without(s: &str, open: &str, close: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(a) = rest.find(open) {
+        out.push_str(&rest[..a]);
+        match rest[a..].find(close) {
+            Some(b) => rest = &rest[a + b + close.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 fn blocks<'a>(s: &'a str, open: &str, close: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut rest = s;
@@ -145,6 +181,10 @@ pub fn parse(mode: Mode, r: &Reply) -> Result<Step, String> {
     if !calls.is_empty() {
         return Ok(Step::Calls(calls));
     }
+    let text = without(&text, "<untrusted", "</untrusted>");
+    if let Some(c) = bare_call(&text) {
+        return Ok(Step::Calls(vec![c]));
+    }
     if text.contains("<tool") {
         return Err("a tool block was started but not closed".into());
     }
@@ -163,6 +203,26 @@ mod tests {
             content: s.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn bare_json_calls_are_calls() {
+        let math = parse(
+            Mode::Native,
+            &reply(r#"{"name":"multiply","parameters":{"x":17,"y":23}}"#),
+        );
+        assert!(matches!(math, Ok(Step::Calls(c)) if c[0].name == "multiply"));
+        let mixed = parse(
+            Mode::Native,
+            &reply(
+                "<untrusted>\nhttps://x.example\n</untrusted>\n\n{\"name\": \"web_search\", \"parameters\": {\"query\": \"cat\"}}",
+            ),
+        );
+        assert!(matches!(mixed, Ok(Step::Calls(c)) if c[0].name == "web_search"));
+        assert_eq!(
+            parse(Mode::Native, &reply(r#"Use {"a": 1} as config."#)).unwrap(),
+            Step::Answer(r#"Use {"a": 1} as config."#.into())
+        );
     }
 
     #[test]

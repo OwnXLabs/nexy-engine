@@ -467,6 +467,7 @@ async fn create(
     }
     app.tasks.put(task.clone());
     let instructions = body["instructions"].as_str().map(String::from);
+    let research = body["metadata"]["research"].as_bool();
     let (a, t) = (app.clone(), task.clone());
     let job = tokio::task::spawn_blocking(move || {
         let Some(bot) = a.bots.get(&t.bot) else {
@@ -482,7 +483,7 @@ async fn create(
                 text: &text,
                 context: instructions.as_deref(),
                 owner: true,
-                research: None,
+                research,
                 workspace: None,
                 cancel: Some(&t.cancel),
                 progress: Some(&progress),

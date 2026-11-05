@@ -254,7 +254,7 @@ fn idle_memory(n: usize) -> i32 {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn serve(app: Arc<App>) -> i32 {
     let a = app.clone();
-    let _ = tokio::task::spawn_blocking(move || ensure_probed(&a)).await;
+    tokio::task::spawn_blocking(move || ensure_probed(&a));
     tokio::spawn(scheduler::run(app.clone()));
     let local = matches!(app.cfg.host.as_str(), "127.0.0.1" | "localhost" | "::1");
     if !local && app.cfg.api_key.is_none() {
