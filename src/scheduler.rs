@@ -56,7 +56,7 @@ fn bad(s: &str) -> String {
 pub async fn run(app: Arc<App>) {
     loop {
         tokio::time::sleep(Duration::from_secs(20)).await;
-        let due: Vec<_> = match app.store.jobs() {
+        let due: Vec<_> = match app.store.jobs(None) {
             Ok(j) => j
                 .into_iter()
                 .filter(|j| j.enabled && j.next_run_at.is_some_and(|t| t <= now()))
@@ -79,6 +79,7 @@ pub async fn run(app: Arc<App>) {
                     Some(bot) => {
                         let session = format!("cron-{}-{}", job.id, now());
                         let _ = app.store.ensure_session(
+                            &job.user,
                             &session,
                             &bot.name,
                             &format!("{}: scheduled", job.name),
@@ -88,11 +89,15 @@ pub async fn run(app: Arc<App>) {
                             &app,
                             bot,
                             crate::agent::Input {
+                                user: &job.user,
                                 session: &session,
                                 text: &job.prompt,
                                 context: None,
                                 owner: false,
+                                research: None,
                                 workspace: None,
+                                cancel: None,
+                                progress: None,
                             },
                         ) {
                             Ok(_) => "ok".into(),

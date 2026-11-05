@@ -1,6 +1,6 @@
 [package]
 name = "nexy-engine"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "A small, sandboxed agent engine for local models"
 license = "MIT"
@@ -10,6 +10,7 @@ keywords = ["agent", "llm", "local", "sandbox", "openai"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+futures-util = { version = "0.3.34", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "original-uri", "query", "tokio"] }
 mimalloc = { version = "0.1.52", default-features = false }
 rusqlite = { version = "0.41.1", features = ["bundled"] }

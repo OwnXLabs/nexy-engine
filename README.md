@@ -63,6 +63,18 @@ NEXY_ENGINE_MODEL_URL=http://127.0.0.1:11434 NEXY_ENGINE_MODEL=qwen3.6:35b-a3b .
 Commands: `serve`, `probe`, `ask TEXT`, `idle-memory N`. Bots are defined in `packs/`. The API listens on
 loopback and needs `NEXY_ENGINE_KEY` to listen anywhere else.
 
+## API
+
+- `POST /v1/chat/completions`: OpenAI-shaped. The engine keeps each session's history; only the
+  last user message is read. `"research": true` makes the engine search and read the top pages
+  before the model answers. Links in a message are always read first.
+- `POST /v1/responses` and `GET /v1/uhp`: the [Unified Harness Protocol](https://unifiedharnessprotocol.org)
+  (core class, version 2026-10-19). Each bot is a harness.
+- `/api/sessions`, `/api/jobs`: history and scheduled tasks.
+- `x-nexy-user`: the user a request acts for, set by the trusted caller. Sessions, memory, jobs and
+  workspaces are kept per user.
+- `/health` answers `{"ok":true}`; details need the key.
+
 ## Test
 
 ```sh

@@ -45,6 +45,14 @@ pub fn step_schema(tools: &[&Tool]) -> Value {
         "required": ["action"]})
 }
 
+pub fn render(mode: Mode, c: &RawCall) -> String {
+    match mode {
+        Mode::Native => String::new(),
+        Mode::Json => json!({"action": c.name, "args": c.args}).to_string(),
+        Mode::Text => format!("<tool>{}</tool>", json!({"name": c.name, "args": c.args})),
+    }
+}
+
 pub fn native_tools(tools: &[&Tool]) -> Option<Value> {
     (!tools.is_empty()).then(|| Value::Array(tools.iter().map(|t| t.openai()).collect()))
 }

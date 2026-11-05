@@ -17,6 +17,8 @@ pub struct Bot {
     pub max_tokens: u32,
     #[serde(default = "default_secs")]
     pub max_secs: u64,
+    #[serde(default)]
+    pub search_first: bool,
 }
 
 fn default_secs() -> u64 {

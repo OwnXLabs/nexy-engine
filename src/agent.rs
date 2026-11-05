@@ -1,10 +1,11 @@
 use crate::App;
 use crate::bots::Bot;
-use crate::model::{Mode, Req};
+use crate::model::{Mode, RawCall, Req};
 use crate::protocol::{self, Step};
 use crate::tools::{self, Ctx, Tool};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const RULES: &str = "\n\n# Rules\n- Use a tool only when it helps; answer directly otherwise.\n\
@@ -24,53 +25,97 @@ pub struct Turn {
     pub mode: String,
 }
 
+pub type Progress<'a> = dyn Fn(&RawCall, &str) + Sync + 'a;
+
 pub struct Input<'a> {
+    pub user: &'a str,
     pub session: &'a str,
     pub text: &'a str,
     pub context: Option<&'a str>,
     pub owner: bool,
+    pub research: Option<bool>,
     pub workspace: Option<&'a std::path::Path>,
+    pub cancel: Option<&'a AtomicBool>,
+    pub progress: Option<&'a Progress<'a>>,
 }
 
 fn system_prompt(bot: &Bot, mode: Mode, tools: &[&Tool]) -> String {
     format!(
-        "{}{RULES}{}",
+        "{}\n\nToday is {} (UTC). Treat this as the current date; your training data is older.{RULES}{}",
         bot.persona.trim(),
+        &crate::store::utc_now()[..10],
         protocol::tool_text(mode, tools)
     )
 }
 
-fn utc_now() -> String {
-    let s = crate::store::now();
-    let (days, rem) = (s / 86_400, s % 86_400);
-    let (y, m, d) = civil(days);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-        rem / 3600,
-        rem % 3600 / 60
-    )
+struct Run<'a> {
+    app: &'a App,
+    cx: Ctx<'a>,
+    session: &'a str,
+    turn: Turn,
+    cancel: Option<&'a AtomicBool>,
+    progress: Option<&'a Progress<'a>>,
 }
 
-fn civil(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
+impl Run<'_> {
+    fn live(&self) -> Result<(), String> {
+        match self.cancel {
+            Some(c) if c.load(Ordering::Relaxed) => Err("cancelled".into()),
+            _ => Ok(()),
+        }
+    }
+
+    fn invoke(&mut self, c: &RawCall) -> Result<String, String> {
+        self.live()?;
+        let tool = tools::find(&c.name).ok_or("unknown tool")?;
+        let out = tools::run(tool, &c.args, &self.cx).unwrap_or_else(|e| format!("error: {e}"));
+        let receipt = json!({"args": c.args, "result": tools::cap(&out)}).to_string();
+        self.app
+            .store
+            .append(self.session, "tool", &receipt, Some(&c.name))
+            .map_err(db)?;
+        self.turn.tools.push(c.name.clone());
+        if let Some(p) = self.progress {
+            p(c, &out);
+        }
+        Ok(if tool.external {
+            untrusted(&c.name, &out)
+        } else {
+            out
+        })
+    }
+}
+
+fn record(mode: Mode, msgs: &mut Vec<Value>, said: &str, results: &[(String, &RawCall, String)]) {
+    if mode == Mode::Native {
+        let tc: Vec<Value> = results
+            .iter()
+            .map(|(id, c, _)| json!({"id": id, "type": "function", "function": {"name": c.name, "arguments": c.args.to_string()}}))
+            .collect();
+        msgs.push(json!({"role": "assistant", "content": "", "tool_calls": tc}));
+        for (id, _, out) in results {
+            msgs.push(json!({"role": "tool", "tool_call_id": id, "content": out}));
+        }
+    } else {
+        msgs.push(json!({"role": "assistant", "content": said}));
+        let joined: Vec<String> = results
+            .iter()
+            .map(|(_, c, out)| format!("[result] {}: {}", c.name, out))
+            .collect();
+        msgs.push(json!({"role": "user", "content": joined.join("\n\n")}));
+    }
 }
 
 pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
     let t0 = Instant::now();
+    crate::ensure_probed(app);
     let caps = app.backend.caps.read().unwrap().clone();
     let mut mode = caps.mode;
     let tools: Vec<&Tool> = bot.tools.iter().filter_map(|n| tools::find(n)).collect();
     let store = &app.store;
     store
         .ensure_session(
+            input.user,
             input.session,
             &bot.name,
             &title(input.text),
@@ -100,7 +145,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
         .append(input.session, "user", input.text, None)
         .map_err(db)?;
 
-    let mut last = format!("Now: {}", utc_now());
+    let mut last = format!("Now: {}", crate::store::utc_now());
     if let Some(c) = input.context.filter(|c| !c.trim().is_empty()) {
         last.push_str("\n\nContext from Nexy:\n");
         last.push_str(c.trim());
@@ -112,30 +157,59 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
     msgs.extend(hist);
     msgs.push(json!({"role": "user", "content": last}));
 
-    let ws = input
-        .workspace
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| app.cfg.data_dir.join("workspaces").join(&bot.name));
+    let ws = input.workspace.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        app.cfg
+            .data_dir
+            .join("workspaces")
+            .join(input.user)
+            .join(&bot.name)
+    });
     std::fs::create_dir_all(&ws).map_err(|e| format!("workspace: {e}"))?;
     let tmp = app
         .cfg
         .data_dir
         .join("tmp")
         .join(input.session.replace(['/', '.'], "_"));
-    let cx = Ctx {
-        bot: &bot.name,
-        store,
-        workspace: ws,
-        tmp,
-        searxng: app.cfg.searxng_url.as_deref(),
+    let mut r = Run {
+        app,
+        cx: Ctx {
+            user: input.user,
+            bot: &bot.name,
+            store,
+            workspace: ws,
+            tmp,
+            searxng: app.cfg.searxng_url.as_deref(),
+        },
+        session: input.session,
+        turn: Turn {
+            mode: format!("{mode:?}").to_lowercase(),
+            ..Default::default()
+        },
+        cancel: input.cancel,
+        progress: input.progress,
     };
-    let mut turn = Turn {
-        mode: format!("{mode:?}").to_lowercase(),
-        ..Default::default()
-    };
+
+    let mut queue = tools::plan(
+        input.text,
+        &tools,
+        input.research.unwrap_or(bot.search_first),
+    );
+    let mut n = 0;
+    while let Some(c) = (!queue.is_empty()).then(|| queue.remove(0)) {
+        let out = r.invoke(&c)?;
+        queue.extend(tools::follow(&c, &out, &tools));
+        record(
+            mode,
+            &mut msgs,
+            &protocol::render(mode, &c),
+            &[(format!("p{n}"), &c, out)],
+        );
+        n += 1;
+    }
     let mut repaired = false;
 
     for step in 0..=bot.max_steps {
+        r.live()?;
         if t0.elapsed() > Duration::from_secs(bot.max_secs) {
             return Err("the turn ran out of time".into());
         }
@@ -173,7 +247,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                 repaired = true;
                 mode = Mode::Text;
                 msgs[0] = json!({"role": "system", "content": system_prompt(bot, mode, &tools)});
-                turn.mode = format!(
+                r.turn.mode = format!(
                     "text (fallback after: {})",
                     e.chars().take(80).collect::<String>()
                 );
@@ -187,9 +261,10 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
             }
             other => other?,
         };
-        turn.steps += 1;
-        turn.prompt_tokens += reply.prompt_tokens;
-        turn.completion_tokens += reply.completion_tokens;
+        r.live()?;
+        r.turn.steps += 1;
+        r.turn.prompt_tokens += reply.prompt_tokens;
+        r.turn.completion_tokens += reply.completion_tokens;
 
         let parsed = protocol::parse(mode, &reply).and_then(|s| match s {
             Step::Calls(cs) if final_step => {
@@ -213,44 +288,15 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                 store
                     .append(input.session, "assistant", &text, None)
                     .map_err(db)?;
-                turn.reply = text;
-                return Ok(turn);
+                r.turn.reply = text;
+                return Ok(r.turn);
             }
             Ok(Step::Calls(calls)) => {
                 let mut results = Vec::new();
                 for (i, c) in calls.iter().enumerate() {
-                    let tool = tools::find(&c.name).expect("validated");
-                    let out =
-                        tools::run(tool, &c.args, &cx).unwrap_or_else(|e| format!("error: {e}"));
-                    let receipt = json!({"args": c.args, "result": tools::cap(&out)}).to_string();
-                    store
-                        .append(input.session, "tool", &receipt, Some(&c.name))
-                        .map_err(db)?;
-                    turn.tools.push(c.name.clone());
-                    let out = if matches!(c.name.as_str(), "remember" | "write_file" | "edit_file")
-                    {
-                        out
-                    } else {
-                        untrusted(&c.name, &out)
-                    };
-                    results.push((format!("s{step}c{i}"), c, out));
+                    results.push((format!("s{step}c{i}"), c, r.invoke(c)?));
                 }
-                if mode == Mode::Native {
-                    let tc: Vec<Value> = results.iter()
-                        .map(|(id, c, _)| json!({"id": id, "type": "function", "function": {"name": c.name, "arguments": c.args.to_string()}}))
-                        .collect();
-                    msgs.push(json!({"role": "assistant", "content": "", "tool_calls": tc}));
-                    for (id, _, out) in &results {
-                        msgs.push(json!({"role": "tool", "tool_call_id": id, "content": out}));
-                    }
-                } else {
-                    msgs.push(json!({"role": "assistant", "content": reply.content}));
-                    let joined: Vec<String> = results
-                        .iter()
-                        .map(|(_, c, out)| format!("[result] {}: {}", c.name, out))
-                        .collect();
-                    msgs.push(json!({"role": "user", "content": joined.join("\n\n")}));
-                }
+                record(mode, &mut msgs, &reply.content, &results);
             }
             Err(why) if !repaired => {
                 repaired = true;
@@ -266,7 +312,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                     mode = Mode::Text;
                     msgs[0] =
                         json!({"role": "system", "content": system_prompt(bot, mode, &tools)});
-                    turn.mode = "text (fallback)".into();
+                    r.turn.mode = "text (fallback)".into();
                 } else {
                     msgs.push(json!({"role": "assistant", "content": reply.content}));
                 }
@@ -334,11 +380,54 @@ fn db(e: rusqlite::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::civil;
+    use super::*;
+
+    const LOOP: &str = include_str!("agent.rs");
 
     #[test]
-    fn civil_dates() {
-        assert_eq!(civil(0), (1970, 1, 1));
-        assert_eq!(civil(20_761), (2026, 11, 4));
+    fn loop_names_no_tools() {
+        let body = &LOOP[..LOOP.find("#[cfg(test)]").unwrap()];
+        for t in tools::ALL {
+            assert!(
+                !body.contains(&format!("\"{}\"", t.name)),
+                "agent loop names the tool {}",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn loop_stays_small() {
+        let n = LOOP
+            .find("#[cfg(test)]")
+            .map_or(0, |i| LOOP[..i].lines().count());
+        assert!(n <= 400, "agent loop is {n} lines, budget 400");
+    }
+
+    #[test]
+    fn prompt_stays_small_at_the_tool_cap() {
+        let all: Vec<&Tool> = tools::ALL.iter().take(8).collect();
+        let bot = Bot {
+            name: "t".into(),
+            persona: "x".repeat(600),
+            persona_file: None,
+            tools: all.iter().map(|t| t.name.to_string()).collect(),
+            max_steps: 6,
+            max_tokens: 1024,
+            max_secs: 60,
+            search_first: false,
+        };
+        for mode in [Mode::Text, Mode::Json] {
+            let n = system_prompt(&bot, mode, &all).len();
+            assert!(
+                n <= 6000,
+                "{mode:?} system prompt is {n} chars, budget 6000"
+            );
+        }
+        let native = protocol::native_tools(&all).unwrap().to_string().len();
+        assert!(
+            native <= 6000,
+            "native tool schemas are {native} chars, budget 6000"
+        );
     }
 }

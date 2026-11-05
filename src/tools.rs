@@ -1,3 +1,4 @@
+use crate::model::RawCall;
 use crate::store::Store;
 use serde_json::{Value, json};
 use std::net::{IpAddr, ToSocketAddrs};
@@ -16,12 +17,14 @@ pub struct Tool {
     pub name: &'static str,
     pub desc: &'static str,
     pub params: &'static [Param],
+    pub external: bool,
 }
 
 pub const ALL: &[Tool] = &[
     Tool {
         name: "web_search",
-        desc: "Search the web. Returns titles, links and snippets.",
+        external: true,
+        desc: "Search the web for current facts: news, prices, reviews, people, products, anything recent. Returns titles, links and snippets.",
         params: &[Param {
             name: "query",
             kind: "string",
@@ -30,7 +33,8 @@ pub const ALL: &[Tool] = &[
     },
     Tool {
         name: "read_page",
-        desc: "Read a public web page as plain text.",
+        external: true,
+        desc: "Read a public web page as plain text. Use it for any link the user gives and to check search results.",
         params: &[Param {
             name: "url",
             kind: "string",
@@ -39,6 +43,7 @@ pub const ALL: &[Tool] = &[
     },
     Tool {
         name: "remember",
+        external: false,
         desc: "Save a fact for later conversations.",
         params: &[Param {
             name: "text",
@@ -48,6 +53,7 @@ pub const ALL: &[Tool] = &[
     },
     Tool {
         name: "recall",
+        external: true,
         desc: "Look up saved facts.",
         params: &[Param {
             name: "query",
@@ -57,6 +63,7 @@ pub const ALL: &[Tool] = &[
     },
     Tool {
         name: "write_file",
+        external: false,
         desc: "Write a text file in your workspace.",
         params: &[
             Param {
@@ -73,6 +80,7 @@ pub const ALL: &[Tool] = &[
     },
     Tool {
         name: "read_file",
+        external: true,
         desc: "Read a text file from your workspace.",
         params: &[Param {
             name: "path",
@@ -82,11 +90,13 @@ pub const ALL: &[Tool] = &[
     },
     Tool {
         name: "list_files",
+        external: true,
         desc: "List files in your workspace.",
         params: &[],
     },
     Tool {
         name: "edit_file",
+        external: false,
         desc: "Replace one exact, unique piece of text in a file.",
         params: &[
             Param {
@@ -108,6 +118,7 @@ pub const ALL: &[Tool] = &[
     },
     Tool {
         name: "run",
+        external: true,
         desc: "Run a shell command in your workspace (sandboxed, no network, 120 s limit).",
         params: &[Param {
             name: "command",
@@ -119,6 +130,54 @@ pub const ALL: &[Tool] = &[
 
 pub fn find(name: &str) -> Option<&'static Tool> {
     ALL.iter().find(|t| t.name == name)
+}
+
+const READ_AHEAD: usize = 2;
+
+pub fn links(text: &str, n: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split_whitespace() {
+        let w = w.trim_matches(|c: char| "<>()[]{}\"'.,;:!?".contains(c));
+        if (w.starts_with("https://") || w.starts_with("http://"))
+            && w.len() > 10
+            && !out.iter().any(|u| u == w)
+        {
+            out.push(w.to_string());
+            if out.len() >= n {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn call(name: &str, key: &str, value: &str) -> RawCall {
+    RawCall {
+        name: name.into(),
+        args: json!({ key: value }),
+    }
+}
+
+pub fn plan(text: &str, offered: &[&Tool], search: bool) -> Vec<RawCall> {
+    let has = |n: &str| offered.iter().any(|t| t.name == n);
+    let urls = links(text, READ_AHEAD);
+    if !urls.is_empty() && has("read_page") {
+        return urls.iter().map(|u| call("read_page", "url", u)).collect();
+    }
+    if search && has("web_search") && text.split_whitespace().count() >= 3 {
+        return vec![call("web_search", "query", text.trim())];
+    }
+    Vec::new()
+}
+
+pub fn follow(done: &RawCall, out: &str, offered: &[&Tool]) -> Vec<RawCall> {
+    if done.name != "web_search" || !offered.iter().any(|t| t.name == "read_page") {
+        return Vec::new();
+    }
+    links(out, READ_AHEAD)
+        .iter()
+        .map(|u| call("read_page", "url", u))
+        .collect()
 }
 
 impl Tool {
@@ -164,6 +223,7 @@ impl Tool {
 }
 
 pub struct Ctx<'a> {
+    pub user: &'a str,
     pub bot: &'a str,
     pub store: &'a Store,
     pub workspace: PathBuf,
@@ -186,12 +246,12 @@ pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
             }),
         "remember" => cx
             .store
-            .remember(cx.bot, &s("text"))
+            .remember(cx.user, cx.bot, &s("text"))
             .map(|_| "saved".into())
             .map_err(|e| e.to_string()),
         "recall" => cx
             .store
-            .recall(cx.bot, &s("query"), 5)
+            .recall(cx.user, cx.bot, &s("query"), 5)
             .map(|v| {
                 if v.is_empty() {
                     "nothing saved matches".into()
@@ -595,6 +655,35 @@ mod tests {
             html_text("<p>Hi <b>there</b></p><script>x()</script>&amp; bye"),
             "Hi there & bye"
         );
+    }
+
+    #[test]
+    fn plans_reads_and_searches() {
+        let offered: Vec<&Tool> = ["web_search", "read_page"]
+            .iter()
+            .filter_map(|n| find(n))
+            .collect();
+        let p = plan("Summarise (https://nixos.org/blog/).", &offered, false);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].name, "read_page");
+        assert_eq!(p[0].args["url"], "https://nixos.org/blog/");
+        assert!(plan("what is the bitcoin price", &offered, false).is_empty());
+        assert_eq!(
+            plan("what is the bitcoin price", &offered, true)[0].name,
+            "web_search"
+        );
+        assert!(plan("hi", &offered, true).is_empty());
+        assert!(
+            plan("please read https://a.example/x", &offered[..1], true)[0].name == "web_search"
+        );
+        let done = call("web_search", "query", "q");
+        let f = follow(
+            &done,
+            "A\nhttps://a.example/1\ns\n\nB\nhttps://b.example/2\ns\n\nC\nhttps://c.example/3",
+            &offered,
+        );
+        assert_eq!(f.len(), 2);
+        assert!(follow(&done, "https://a.example/1", &offered[..1]).is_empty());
     }
 
     #[test]

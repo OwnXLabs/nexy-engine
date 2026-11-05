@@ -11,10 +11,12 @@ mod scheduler;
 mod server;
 mod store;
 mod tools;
+mod uhp;
 
 use mimalloc::MiMalloc;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -26,6 +28,8 @@ pub struct App {
     pub gate: gate::Gate,
     pub bots: HashMap<String, bots::Bot>,
     pub default_bot: String,
+    pub probe_tried: AtomicI64,
+    pub tasks: uhp::Tasks,
 }
 
 fn build() -> Result<App, String> {
@@ -62,6 +66,8 @@ fn build() -> Result<App, String> {
         backend,
         bots,
         default_bot,
+        probe_tried: AtomicI64::new(0),
+        tasks: uhp::Tasks::default(),
     })
 }
 
@@ -86,16 +92,37 @@ fn probe(app: &App) -> Result<model::Caps, String> {
     Ok(c)
 }
 
-fn ensure_probed(app: &App) -> Result<(), String> {
-    if app.backend.caps.read().unwrap().probed_at == 0 {
-        eprintln!("probing {} ({})...", app.cfg.model_url, app.cfg.model);
-        let c = probe(app)?;
-        eprintln!(
-            "mode {:?}, native tools {}, json schema {}, {} tok/s",
-            c.mode, c.native_tools, c.json_schema, c.decode_tok_s
-        );
+const PROBE_RETRY_SECS: i64 = 30;
+
+pub fn ensure_probed(app: &App) -> bool {
+    if app.backend.caps.read().unwrap().probed_at != 0 {
+        return true;
     }
-    Ok(())
+    let now = store::now();
+    let last = app.probe_tried.load(Ordering::Relaxed);
+    if now - last < PROBE_RETRY_SECS
+        || app
+            .probe_tried
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return false;
+    }
+    eprintln!("probing {} ({})...", app.cfg.model_url, app.cfg.model);
+    let _slot = app.gate.acquire(true);
+    match probe(app) {
+        Ok(c) => {
+            eprintln!(
+                "mode {:?}, native tools {}, json schema {}, {} tok/s",
+                c.mode, c.native_tools, c.json_schema, c.decode_tok_s
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("probe failed: {e}; tools in text mode, retrying in {PROBE_RETRY_SECS} s");
+            false
+        }
+    }
 }
 
 fn main() {
@@ -158,19 +185,22 @@ fn ask(app: &App, args: &[String]) -> i32 {
         eprintln!("no bot \"{bot}\"");
         return 2;
     };
-    if let Err(e) = ensure_probed(app) {
-        eprintln!("{e}");
+    if !ensure_probed(app) {
         return 1;
     }
     match agent::run(
         app,
         b,
         agent::Input {
+            user: store::DEFAULT_USER,
             session: &session,
             text: &words.join(" "),
             context: None,
             owner: true,
+            research: None,
             workspace: workspace.as_deref(),
+            cancel: None,
+            progress: None,
         },
     ) {
         Ok(t) => {
@@ -224,9 +254,7 @@ fn idle_memory(n: usize) -> i32 {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn serve(app: Arc<App>) -> i32 {
     let a = app.clone();
-    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || ensure_probed(&a)).await {
-        eprintln!("warning: {e}; starting anyway, tools in text mode");
-    }
+    let _ = tokio::task::spawn_blocking(move || ensure_probed(&a)).await;
     tokio::spawn(scheduler::run(app.clone()));
     let local = matches!(app.cfg.host.as_str(), "127.0.0.1" | "localhost" | "::1");
     if !local && app.cfg.api_key.is_none() {
