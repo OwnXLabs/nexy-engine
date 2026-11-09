@@ -41,6 +41,7 @@ pub struct Input<'a> {
     pub workspace: Option<&'a std::path::Path>,
     pub cancel: Option<&'a AtomicBool>,
     pub progress: Option<&'a Progress<'a>>,
+    pub on_text: Option<&'a dyn Fn(&str)>,
 }
 
 fn system_prompt(bot: &Bot, mode: Mode, tools: &[&Tool]) -> String {
@@ -220,6 +221,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
     }
     let mut repaired = false;
     let budget = caps.prompt_chars(bot.max_tokens).min(PROMPT_CHARS);
+    let stream = protocol::Stream::new(input.on_text);
 
     for step in 0..=bot.max_steps {
         r.live()?;
@@ -227,22 +229,17 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
             return Err("the turn ran out of time".into());
         }
         compact(&mut msgs, budget);
+        stream.step();
         let final_step = step == bot.max_steps;
         let offer: Vec<&Tool> = if final_step {
             Vec::new()
         } else {
             tools.clone()
         };
-        let native = if mode == Mode::Native {
-            protocol::native_tools(&offer)
-        } else {
-            None
-        };
-        let schema = if mode == Mode::Json {
-            Some(protocol::step_schema(&offer))
-        } else {
-            None
-        };
+        let native = (mode == Mode::Native)
+            .then(|| protocol::native_tools(&offer))
+            .flatten();
+        let schema = (mode == Mode::Json).then(|| protocol::step_schema(&offer));
         if final_step {
             msgs.push(json!({"role": "user", "content": "[result] Step limit reached. Give your final answer now, without tools."}));
         }
@@ -253,6 +250,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                 tools: native.as_ref(),
                 schema: schema.as_ref(),
                 max_tokens: bot.max_tokens,
+                on_text: stream.sink(mode),
             })
         };
         let reply = match first {
@@ -270,6 +268,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                     tools: None,
                     schema: None,
                     max_tokens: bot.max_tokens,
+                    on_text: stream.sink(mode),
                 })?
             }
             other => other?,
@@ -308,6 +307,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                 store
                     .append(input.session, "assistant", &text, None)
                     .map_err(db)?;
+                stream.answer(&text);
                 r.turn.reply = text;
                 return Ok(r.turn);
             }

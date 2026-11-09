@@ -193,6 +193,7 @@ pub async fn run(app: Arc<App>) {
                                 workspace: None,
                                 cancel: None,
                                 progress: None,
+                                on_text: None,
                             },
                         ) {
                             Ok(_) => "ok".into(),

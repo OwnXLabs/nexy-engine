@@ -14,6 +14,93 @@ impl PartialEq for RawCall {
     }
 }
 
+#[derive(Default)]
+struct Shown {
+    raw: String,
+    sent: usize,
+    held: bool,
+    any: bool,
+}
+
+/// Streams a step's text to the user only while it cannot be a tool call or reasoning.
+pub struct Stream<'a> {
+    out: Option<&'a dyn Fn(&str)>,
+    st: std::cell::RefCell<Shown>,
+}
+
+impl<'a> Stream<'a> {
+    pub fn new(out: Option<&'a dyn Fn(&str)>) -> Self {
+        Stream {
+            out,
+            st: Default::default(),
+        }
+    }
+
+    pub fn sink(&self, mode: Mode) -> Option<&dyn crate::model::Sink> {
+        self.out
+            .filter(|_| mode != Mode::Json)
+            .map(|_| self as &dyn crate::model::Sink)
+    }
+
+    fn emit(&self, s: &mut Shown, t: &str) {
+        if let Some(out) = self.out.filter(|_| !t.is_empty()) {
+            if s.sent == 0 && s.any {
+                out("\n\n");
+            }
+            out(t);
+            s.any = true;
+        }
+    }
+
+    pub fn step(&self) {
+        let mut s = self.st.borrow_mut();
+        *s = Shown {
+            any: s.any,
+            ..Default::default()
+        };
+    }
+
+    pub fn answer(&self, text: &str) {
+        let mut s = self.st.borrow_mut();
+        let sent = s.raw.trim_start()[..s.sent].to_string();
+        match text.strip_prefix(sent.as_str()) {
+            Some(rest) => {
+                let rest = rest.to_string();
+                self.emit(&mut s, &rest);
+            }
+            None => {
+                s.sent = 0;
+                self.emit(&mut s, text);
+            }
+        }
+    }
+}
+
+impl crate::model::Sink for Stream<'_> {
+    fn text(&self, delta: &str) {
+        let mut s = self.st.borrow_mut();
+        s.raw.push_str(delta);
+        if s.held {
+            return;
+        }
+        let t = s.raw.trim_start();
+        if s.sent == 0 && t.starts_with(['<', '{', '[', '`']) {
+            s.held = true;
+            return;
+        }
+        let cut = t.find(['<', '{']).unwrap_or(t.len());
+        let held = cut < t.len();
+        let ready = t[..cut].trim_end();
+        let fresh = ready.get(s.sent..).unwrap_or("").to_string();
+        let len = ready.len();
+        s.held = held;
+        if !fresh.is_empty() {
+            self.emit(&mut s, &fresh);
+            s.sent = len;
+        }
+    }
+}
+
 pub fn tool_text(mode: Mode, tools: &[&Tool]) -> String {
     if tools.is_empty() || mode == Mode::Native {
         return String::new();
@@ -285,6 +372,55 @@ mod tests {
             content: s.into(),
             ..Default::default()
         }
+    }
+
+    fn streamed(steps: &[(&[&str], Option<&str>)]) -> String {
+        let got = std::cell::RefCell::new(String::new());
+        let out = |t: &str| got.borrow_mut().push_str(t);
+        let s = Stream::new(Some(&out));
+        for (deltas, answer) in steps {
+            s.step();
+            for d in *deltas {
+                s.sink(Mode::Native).unwrap().text(d);
+            }
+            if let Some(a) = answer {
+                s.answer(a);
+            }
+        }
+        got.into_inner()
+    }
+
+    #[test]
+    fn streams_answers_but_never_calls_or_reasoning() {
+        assert_eq!(
+            streamed(&[(&["  Hel", "lo ", "there.\n"], Some("Hello there."))]),
+            "Hello there."
+        );
+        assert_eq!(
+            streamed(&[(&["{\"name\": \"run\", ", "\"arguments\": {}}"], None)]),
+            ""
+        );
+        assert_eq!(
+            streamed(&[(&["<think>hm</think>", "Hi"], Some("Hi"))]),
+            "Hi"
+        );
+        assert_eq!(
+            streamed(&[(&["Sure.\n", "{\"name\": \"x\"}"], Some("Sure."))]),
+            "Sure."
+        );
+        assert_eq!(
+            streamed(&[(&["Let me check."], None), (&["Done", "."], Some("Done."))]),
+            "Let me check.\n\nDone."
+        );
+        assert_eq!(
+            streamed(&[(&["A ", "b"], Some("A b\n\nSources:\n- https://x.example"))]),
+            "A b\n\nSources:\n- https://x.example"
+        );
+        assert_eq!(streamed(&[(&["Oops"], Some("Fixed"))]), "Oops\n\nFixed");
+        let s = Stream::new(None);
+        assert!(s.sink(Mode::Native).is_none());
+        let out = |_: &str| {};
+        assert!(Stream::new(Some(&out)).sink(Mode::Json).is_none());
     }
 
     #[test]

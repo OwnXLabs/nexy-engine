@@ -98,6 +98,29 @@ pub struct Req<'a> {
     pub tools: Option<&'a Value>,
     pub schema: Option<&'a Value>,
     pub max_tokens: u32,
+    pub on_text: Option<&'a dyn Sink>,
+}
+
+pub trait Sink {
+    fn text(&self, t: &str);
+}
+
+fn lines(resp: ureq::Response, mut each: impl FnMut(Value)) -> Result<(), String> {
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(resp.into_reader()).lines() {
+        let line = line.map_err(|e| format!("model stream broke: {e}"))?;
+        let data = line.strip_prefix("data:").unwrap_or(&line).trim();
+        if data.is_empty() || data == "[DONE]" || line.starts_with(':') {
+            continue;
+        }
+        let v: Value =
+            serde_json::from_str(data).map_err(|e| format!("model stream unreadable: {e}"))?;
+        if let Some(e) = v.get("error") {
+            return Err(format!("model server error: {e}"));
+        }
+        each(v);
+    }
+    Ok(())
 }
 
 pub struct Backend {
@@ -110,6 +133,7 @@ pub struct Backend {
 
 fn args_of(v: &Value) -> Value {
     match v {
+        Value::String(s) if s.trim().is_empty() => json!({}),
         Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone())),
         Value::Null => json!({}),
         other => other.clone(),
@@ -225,6 +249,40 @@ impl Backend {
         if let Some(s) = req.schema {
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "step", "strict": true, "schema": s}});
         }
+        if let Some(on_text) = req.on_text {
+            body["stream"] = json!(true);
+            body["stream_options"] = json!({"include_usage": true});
+            let mut r = Reply::default();
+            let mut calls: Vec<(String, String)> = Vec::new();
+            lines(self.post("/v1/chat/completions", body)?, |v| {
+                if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+                    r.prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
+                    r.completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
+                }
+                let d = &v["choices"][0]["delta"];
+                if let Some(t) = d["content"].as_str().filter(|t| !t.is_empty()) {
+                    r.content.push_str(t);
+                    on_text.text(t);
+                }
+                for c in d["tool_calls"].as_array().into_iter().flatten() {
+                    let i = c["index"].as_u64().unwrap_or(calls.len() as u64) as usize;
+                    if calls.len() <= i {
+                        calls.resize(i + 1, Default::default());
+                    }
+                    let f = &c["function"];
+                    calls[i].0.push_str(f["name"].as_str().unwrap_or(""));
+                    calls[i].1.push_str(f["arguments"].as_str().unwrap_or(""));
+                }
+            })?;
+            r.calls = calls
+                .into_iter()
+                .map(|(name, args)| RawCall {
+                    name,
+                    args: args_of(&Value::String(args)),
+                })
+                .collect();
+            return Ok(r);
+        }
         let v: Value = self
             .post("/v1/chat/completions", body)?
             .into_json()
@@ -266,6 +324,24 @@ impl Backend {
     }
 
     fn ollama_chat(&self, req: &Req, caps: &Caps) -> Result<Reply, String> {
+        if let Some(on_text) = req.on_text {
+            let mut body = self.ollama_body(req, caps);
+            body["stream"] = json!(true);
+            let mut r = Reply::default();
+            lines(self.post("/api/chat", body)?, |v| {
+                let msg = &v["message"];
+                if let Some(t) = msg["content"].as_str().filter(|t| !t.is_empty()) {
+                    r.content.push_str(t);
+                    on_text.text(t);
+                }
+                r.calls.extend(calls_of(msg));
+                if v["done"] == true {
+                    r.prompt_tokens = v["prompt_eval_count"].as_u64().unwrap_or(0);
+                    r.completion_tokens = v["eval_count"].as_u64().unwrap_or(0);
+                }
+            })?;
+            return Ok(r);
+        }
         let v: Value = self
             .post("/api/chat", self.ollama_body(req, caps))?
             .into_json()
@@ -320,6 +396,7 @@ impl Backend {
                 tools: None,
                 schema: None,
                 max_tokens: 256,
+                on_text: None,
             },
             caps,
         )
@@ -380,6 +457,7 @@ impl Backend {
                     tools: Some(&tools),
                     schema: None,
                     max_tokens: 256,
+                    on_text: None,
                 },
                 &caps,
             )
@@ -400,6 +478,7 @@ impl Backend {
                     tools: None,
                     schema: Some(&schema),
                     max_tokens: 128,
+                    on_text: None,
                 },
                 &caps,
             )
@@ -416,6 +495,7 @@ impl Backend {
                 tools: None,
                 schema: None,
                 max_tokens: 200,
+                on_text: None,
             },
             &caps,
         ) {

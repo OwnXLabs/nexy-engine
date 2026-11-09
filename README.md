@@ -72,7 +72,9 @@ loopback and needs `NEXY_ENGINE_KEY` to listen anywhere else.
 
 - `POST /v1/chat/completions`: OpenAI-shaped. The engine keeps each session's history; only the
   last user message is read. `"research": true` makes the engine search and read the top pages
-  before the model answers. Links in a message are always read first.
+  before the model answers. Links in a message are always read first. With `"stream": true` the
+  reply streams as server-sent events as the model writes it; tool calls and reasoning are held
+  back, tool use shows as `: tool <name>` comments, and the last event carries `usage` and `nexy`.
 - `POST /v1/responses` and `GET /v1/uhp`: the [Unified Harness Protocol](https://unifiedharnessprotocol.org)
   (core class, version 2026-10-19). Each bot is a harness.
 - `/api/sessions`, `/api/jobs`: history and scheduled tasks (routines). A schedule is `every 30m`,

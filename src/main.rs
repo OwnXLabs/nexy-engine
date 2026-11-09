@@ -206,6 +206,7 @@ fn ask(app: &App, args: &[String]) -> i32 {
             workspace: workspace.as_deref(),
             cancel: None,
             progress: None,
+            on_text: None,
         },
     ) {
         Ok(t) => {
