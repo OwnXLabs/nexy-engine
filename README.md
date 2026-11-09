@@ -20,8 +20,10 @@ The goal is simple: keep the engine efficient, so the model gets the machine's m
 - **The engine owns tool calling.** Probe the server, pick native tools, forced JSON or a text
   protocol, check every call, retry once with the error, then stop and say why.
 - **Set everything explicitly.** Thinking and sampling settings are sent on every request.
-- **Lock down each command.** `run` uses a fresh Landlock-confined process: workspace only, no TCP,
-  CPU and memory limits, never as root. If it can't be confined, it doesn't run.
+- **Lock down each command.** `run` uses a fresh confined process (Landlock on Linux, a
+  deny-by-default `sandbox-exec` profile on macOS): writes only to the workspace and its temp
+  folder, no network, CPU and memory limits, never as root. If it can't be confined, it doesn't
+  run; Windows has no sandbox yet, so `run` is refused there.
 
 ## Benchmark (v0.0.1, November 2026)
 
