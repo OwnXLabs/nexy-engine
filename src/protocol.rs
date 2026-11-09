@@ -326,7 +326,7 @@ pub fn parse(mode: Mode, r: &Reply) -> Result<Step, String> {
         let v = lenient_json(text.trim_start_matches("```json").trim_matches('`').trim())
             .ok_or("your answer was not one JSON object")?;
         return match v["action"].as_str() {
-            Some("reply") => Ok(Step::Answer(v["text"].as_str().unwrap_or("").to_string())),
+            Some("reply") => Ok(Step::Answer(strip_think(v["text"].as_str().unwrap_or("")))),
             Some(_) => call_from(&v)
                 .map(|c| Step::Calls(vec![c]))
                 .ok_or_else(|| "missing \"action\"".into()),
