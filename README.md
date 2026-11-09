@@ -72,7 +72,9 @@ loopback and needs `NEXY_ENGINE_KEY` to listen anywhere else.
   before the model answers. Links in a message are always read first.
 - `POST /v1/responses` and `GET /v1/uhp`: the [Unified Harness Protocol](https://unifiedharnessprotocol.org)
   (core class, version 2026-10-19). Each bot is a harness.
-- `/api/sessions`, `/api/jobs`: history and scheduled tasks.
+- `/api/sessions`, `/api/jobs`: history and scheduled tasks (routines). A schedule is `every 30m`,
+  `daily 08:00` or standard 5-field cron such as `0 9 * * 1-5`, all in UTC. Bots with the
+  `routine` tool can also create, list and delete routines in chat.
 - `x-nexy-user`: the user a request acts for, set by the trusted caller. Sessions, memory, jobs and
   workspaces are kept per user.
 - `/health` answers `{"ok":true}`; details need the key.

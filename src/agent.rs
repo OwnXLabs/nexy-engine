@@ -189,6 +189,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
             workspace: ws,
             tmp,
             searxng: app.cfg.searxng_url.as_deref(),
+            owner: input.owner,
         },
         session: input.session,
         turn: Turn {
@@ -433,7 +434,9 @@ mod tests {
 
     #[test]
     fn prompt_stays_small_at_the_tool_cap() {
-        let all: Vec<&Tool> = tools::ALL.iter().take(8).collect();
+        let mut all: Vec<&Tool> = tools::ALL.iter().collect();
+        all.sort_by_key(|t| std::cmp::Reverse(t.openai().to_string().len()));
+        all.truncate(8);
         let bot = Bot {
             name: "t".into(),
             persona: "x".repeat(600),

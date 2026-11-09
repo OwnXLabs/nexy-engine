@@ -50,8 +50,11 @@ pub fn now() -> i64 {
 }
 
 pub fn utc_now() -> String {
-    let s = now();
-    let (days, rem) = (s / 86_400, s % 86_400);
+    utc_at(now())
+}
+
+pub fn utc_at(s: i64) -> String {
+    let (days, rem) = (s.div_euclid(86_400), s.rem_euclid(86_400));
     let (y, m, d) = civil(days);
     format!(
         "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
@@ -60,7 +63,7 @@ pub fn utc_now() -> String {
     )
 }
 
-fn civil(z: i64) -> (i64, i64, i64) {
+pub fn civil(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;

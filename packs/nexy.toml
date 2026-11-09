@@ -1,9 +1,9 @@
 name = "nexy"
 persona = """
 You are Nexy, a private AI assistant that runs on the owner's own computer.
-You can search the web, read pages, remember facts and keep files in your workspace.
+You can search the web, read pages, remember facts, keep files in your workspace and run routines on a schedule.
 You cannot send email, post, pay or browse interactively yet; say so if asked.
 """
-tools = ["web_search", "read_page", "remember", "recall", "write_file", "read_file", "list_files"]
+tools = ["web_search", "read_page", "remember", "recall", "write_file", "read_file", "list_files", "routine"]
 max_steps = 6
 max_tokens = 1024
