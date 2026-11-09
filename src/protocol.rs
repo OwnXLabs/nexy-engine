@@ -91,7 +91,82 @@ fn call_from(v: &Value) -> Option<RawCall> {
     Some(RawCall { name, args })
 }
 
-fn bare_call(text: &str) -> Option<RawCall> {
+fn first_value(s: &str) -> Option<Value> {
+    serde_json::Deserializer::from_str(s)
+        .into_iter::<Value>()
+        .next()?
+        .ok()
+}
+
+pub fn lenient_json(s: &str) -> Option<Value> {
+    first_value(s).or_else(|| first_value(&repair(s)))
+}
+
+fn repair(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut it = s.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = it.next() {
+        if !in_str {
+            if c == '"' {
+                in_str = true;
+                if it.peek() == Some(&'"')
+                    && out.trim_end().ends_with(['{', ','])
+                    && it.clone().nth(1).is_some_and(|n| n.is_alphabetic())
+                {
+                    it.next();
+                }
+            }
+            out.push(c);
+            continue;
+        }
+        match c {
+            '\\' => match it.next() {
+                Some(n @ ('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                Some(n) => out.push(n),
+                None => {}
+            },
+            '"' => {
+                let next = it.clone().find(|n| !n.is_whitespace());
+                if next.is_none_or(|n| matches!(n, ',' | '}' | ']' | ':')) {
+                    in_str = false;
+                    out.push('"');
+                } else {
+                    out.push_str("\\\"");
+                }
+            }
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn looks_like_call(t: &str) -> bool {
+    let t = t
+        .trim_start_matches('{')
+        .trim_start()
+        .trim_start_matches('"');
+    let Some(rest) = t
+        .strip_prefix("name\"")
+        .or_else(|| t.strip_prefix("action\""))
+    else {
+        return false;
+    };
+    let name: String = rest
+        .trim_start_matches([' ', ':', '"'])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    crate::tools::find(&name).is_some()
+}
+
+fn bare_call(text: &str) -> Result<Option<RawCall>, String> {
     let t = text
         .trim()
         .trim_start_matches("```json")
@@ -100,14 +175,26 @@ fn bare_call(text: &str) -> Option<RawCall> {
     let start = if t.starts_with('{') {
         0
     } else {
-        t.find("\n{")? + 1
+        match t.find("\n{") {
+            Some(i) => i + 1,
+            None => return Ok(None),
+        }
     };
-    let v: Value = serde_json::from_str(t[start..].trim()).ok()?;
-    let shaped = v["name"].is_string()
-        && ["parameters", "arguments", "args"]
-            .iter()
-            .any(|k| v.get(*k).is_some());
-    if shaped { call_from(&v) } else { None }
+    let t = t[start..].trim();
+    if let Some(v) = lenient_json(t) {
+        let shaped = (v["name"].is_string() || v["action"].is_string())
+            && ["parameters", "arguments", "args"]
+                .iter()
+                .any(|k| v.get(*k).is_some());
+        return Ok(if shaped { call_from(&v) } else { None });
+    }
+    if looks_like_call(t) {
+        return Err(
+            "your tool call was not valid JSON; check the quotes and backslashes inside its strings"
+                .into(),
+        );
+    }
+    Ok(None)
 }
 
 fn without(s: &str, open: &str, close: &str) -> String {
@@ -149,9 +236,8 @@ pub fn parse(mode: Mode, r: &Reply) -> Result<Step, String> {
     }
     let text = strip_think(&r.content);
     if mode == Mode::Json {
-        let v: Value =
-            serde_json::from_str(text.trim_start_matches("```json").trim_matches('`').trim())
-                .map_err(|_| "your answer was not one JSON object".to_string())?;
+        let v = lenient_json(text.trim_start_matches("```json").trim_matches('`').trim())
+            .ok_or("your answer was not one JSON object")?;
         return match v["action"].as_str() {
             Some("reply") => Ok(Step::Answer(v["text"].as_str().unwrap_or("").to_string())),
             Some(_) => call_from(&v)
@@ -163,11 +249,7 @@ pub fn parse(mode: Mode, r: &Reply) -> Result<Step, String> {
     let mut calls = Vec::new();
     for (open, close) in [("<tool>", "</tool>"), ("<tool_call>", "</tool_call>")] {
         for b in blocks(&text, open, close) {
-            match serde_json::from_str::<Value>(b)
-                .ok()
-                .as_ref()
-                .and_then(call_from)
-            {
+            match lenient_json(b).as_ref().and_then(call_from) {
                 Some(c) => calls.push(c),
                 None => {
                     return Err(format!(
@@ -182,7 +264,7 @@ pub fn parse(mode: Mode, r: &Reply) -> Result<Step, String> {
         return Ok(Step::Calls(calls));
     }
     let text = without(&text, "<untrusted", "</untrusted>");
-    if let Some(c) = bare_call(&text) {
+    if let Some(c) = bare_call(&text)? {
         return Ok(Step::Calls(vec![c]));
     }
     if text.contains("<tool") {
@@ -223,6 +305,53 @@ mod tests {
             parse(Mode::Native, &reply(r#"Use {"a": 1} as config."#)).unwrap(),
             Step::Answer(r#"Use {"a": 1} as config."#.into())
         );
+    }
+
+    #[test]
+    fn broken_json_calls_are_repaired_or_refused() {
+        let call = |s: &str| match parse(Mode::Native, &reply(s)) {
+            Ok(Step::Calls(c)) => c[0].clone(),
+            other => panic!("{s}: {other:?}"),
+        };
+        let c = call(r#"{"name":"run","parameters":{"command":"echo nexy-\$((6*7))"}}"#);
+        assert_eq!(c.args["command"], "echo nexy-$((6*7))");
+        let c = call(
+            r#"{"name": "write_file", "parameters": {"path": "signup.html", "content": "<html><form><input type="email" name="email"><input type="submit" value="Sign up"></form></html>"}}"#,
+        );
+        assert_eq!(c.args["path"], "signup.html");
+        assert!(
+            c.args["content"]
+                .as_str()
+                .unwrap()
+                .contains(r#"<input type="email" name="email">"#)
+        );
+        let c =
+            call(r#"{"name":"remember",""parameters":{"text":"My dog\'s name is Biscuit-7."}}"#);
+        assert_eq!(c.args["text"], "My dog's name is Biscuit-7.");
+        let c = call(r#"{"name":"recall",""parameters":{"query":"Aldren Bridge length"}}"#);
+        assert_eq!(c.args["query"], "Aldren Bridge length");
+        let c = call(
+            r#"{"name":"read_page","parameters":{"url":"<page source="garden-tips.example">"}}"#,
+        );
+        assert_eq!(c.args["url"], r#"<page source="garden-tips.example">"#);
+        let c = call("Sure.\n```json\n{\"name\": \"list_files\", \"arguments\": {}}\n```\nDone.");
+        assert_eq!(c.name, "list_files");
+        assert!(
+            parse(
+                Mode::Native,
+                &reply(r#"{"name": "write_file", "parameters": {"path": "a.txt", "content": "x}"#)
+            )
+            .is_err()
+        );
+        let person = r#"{"name": "Maria", "age": 34, "tags": ["hiking", "chess"]}"#;
+        assert_eq!(
+            parse(Mode::Native, &reply(person)).unwrap(),
+            Step::Answer(person.into())
+        );
+        assert!(matches!(
+            parse(Mode::Native, &reply(r#"{"name": "Maria", "age": }"#)),
+            Ok(Step::Answer(_))
+        ));
     }
 
     #[test]
