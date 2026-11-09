@@ -13,6 +13,12 @@ pub struct Param {
     pub desc: &'static str,
 }
 
+impl Param {
+    pub fn optional(&self) -> bool {
+        self.kind.ends_with('?')
+    }
+}
+
 pub struct Tool {
     pub name: &'static str,
     pub desc: &'static str,
@@ -125,6 +131,38 @@ pub const ALL: &[Tool] = &[
             kind: "string",
             desc: "the command",
         }],
+    },
+    Tool {
+        name: "routine",
+        external: false,
+        desc: "Create, list or delete routines: prompts you run on a schedule for the user.",
+        params: &[
+            Param {
+                name: "action",
+                kind: "string",
+                desc: "create, list or delete",
+            },
+            Param {
+                name: "name",
+                kind: "string?",
+                desc: "short name (create)",
+            },
+            Param {
+                name: "schedule",
+                kind: "string?",
+                desc: "UTC: \"daily 08:00\", \"every 2h\" or cron such as \"0 9 * * 1-5\" (create)",
+            },
+            Param {
+                name: "prompt",
+                kind: "string?",
+                desc: "what to do each time it runs (create)",
+            },
+            Param {
+                name: "id",
+                kind: "integer?",
+                desc: "routine id (delete)",
+            },
+        ],
     },
 ];
 
@@ -288,11 +326,16 @@ impl Tool {
             .map(|p| {
                 (
                     p.name.to_string(),
-                    json!({"type": p.kind, "description": p.desc}),
+                    json!({"type": p.kind.trim_end_matches('?'), "description": p.desc}),
                 )
             })
             .collect();
-        let req: Vec<&str> = self.params.iter().map(|p| p.name).collect();
+        let req: Vec<&str> = self
+            .params
+            .iter()
+            .filter(|p| !p.optional())
+            .map(|p| p.name)
+            .collect();
         json!({"type": "object", "properties": props, "required": req})
     }
 
@@ -301,7 +344,11 @@ impl Tool {
     }
 
     pub fn line(&self) -> String {
-        let ps: Vec<&str> = self.params.iter().map(|p| p.name).collect();
+        let ps: Vec<String> = self
+            .params
+            .iter()
+            .map(|p| format!("{}{}", p.name, if p.optional() { "?" } else { "" }))
+            .collect();
         format!("{}({}): {}", self.name, ps.join(", "), self.desc)
     }
 
@@ -311,8 +358,9 @@ impl Tool {
             .ok_or_else(|| format!("{}: arguments must be a JSON object", self.name))?;
         for p in self.params {
             match obj.get(p.name) {
+                None | Some(Value::Null) if p.optional() => {}
                 None => return Err(format!("{}: missing \"{}\"", self.name, p.name)),
-                Some(v) if p.kind == "string" && !v.is_string() => {
+                Some(v) if p.kind.starts_with("string") && !v.is_string() => {
                     return Err(format!("{}: \"{}\" must be a string", self.name, p.name));
                 }
                 _ => {}
@@ -329,6 +377,73 @@ pub struct Ctx<'a> {
     pub workspace: PathBuf,
     pub tmp: PathBuf,
     pub searxng: Option<&'a str>,
+    pub owner: bool,
+}
+
+fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
+    let s = |k: &str| args[k].as_str().unwrap_or("").trim().to_string();
+    match s("action").to_lowercase().as_str() {
+        "list" => {
+            let jobs = cx.store.jobs(Some(cx.user)).map_err(|e| e.to_string())?;
+            if jobs.is_empty() {
+                return Ok("no routines".into());
+            }
+            Ok(jobs
+                .iter()
+                .map(|j| {
+                    format!(
+                        "id {}: {} | {} | next {} | {}",
+                        j.id,
+                        j.name,
+                        j.schedule,
+                        j.next_run_at.map_or("-".into(), crate::store::utc_at),
+                        j.prompt
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "create" => {
+            if !cx.owner {
+                return Err("routines can only be created in a conversation with the user".into());
+            }
+            let (name, schedule, prompt) = (s("name"), s("schedule"), s("prompt"));
+            if schedule.is_empty() || prompt.is_empty() {
+                return Err("create needs \"schedule\" and \"prompt\"".into());
+            }
+            let name = if name.is_empty() {
+                prompt.chars().take(40).collect()
+            } else {
+                name
+            };
+            let next = crate::scheduler::next_run(&schedule, crate::store::now())?;
+            let id = cx
+                .store
+                .add_job(cx.user, cx.bot, &name, &schedule, &prompt, Some(next))
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "created routine {id} \"{name}\" ({schedule}); first run {}",
+                crate::store::utc_at(next)
+            ))
+        }
+        "delete" => {
+            let id = args["id"]
+                .as_i64()
+                .or_else(|| args["id"].as_str().and_then(|v| v.trim().parse().ok()))
+                .ok_or("delete needs the routine \"id\"; list them first")?;
+            match cx
+                .store
+                .delete_job(cx.user, id)
+                .map_err(|e| e.to_string())?
+            {
+                0 => Err(format!("there is no routine {id}")),
+                _ => Ok(format!("deleted routine {id}")),
+            }
+        }
+        other => Err(format!(
+            "unknown action \"{other}\": use create, list or delete"
+        )),
+    }
 }
 
 pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
@@ -405,6 +520,7 @@ pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
             &s("command"),
             Duration::from_secs(120),
         ),
+        "routine" => routine(args, cx),
         other => Err(format!("unknown tool {other}")),
     }?;
     Ok(cap(&out))
@@ -815,6 +931,61 @@ mod tests {
                 .contains("nixos-2605")
         );
         assert!(follow(&done, "https://a.example/1", &offered[..1]).is_empty());
+    }
+
+    #[test]
+    fn routines_are_a_tool() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let cx = |user, owner| Ctx {
+            user,
+            bot: "nexy",
+            store: &store,
+            workspace: std::env::temp_dir(),
+            tmp: std::env::temp_dir(),
+            searxng: None,
+            owner,
+        };
+        let t = find("routine").unwrap();
+        let go = |args: Value, c: &Ctx| {
+            t.validate(&args)?;
+            run(t, &args, c)
+        };
+        let a = cx("a", true);
+        let made = go(
+            json!({"action": "create", "name": "brief", "schedule": "0 9 * * 1-5", "prompt": "Brief me."}),
+            &a,
+        )
+        .unwrap();
+        assert!(made.starts_with("created routine 1 \"brief\""), "{made}");
+        assert!(made.contains("09:00 UTC"), "{made}");
+        assert!(
+            go(
+                json!({"action": "create", "schedule": "whenever", "prompt": "x"}),
+                &a
+            )
+            .is_err()
+        );
+        assert!(go(json!({"action": "create", "schedule": "every 1h"}), &a).is_err());
+        assert!(
+            go(
+                json!({"action": "create", "schedule": "every 1h", "prompt": "x"}),
+                &cx("a", false)
+            )
+            .is_err()
+        );
+        let listed = go(json!({"action": "list"}), &a).unwrap();
+        assert!(listed.contains("id 1: brief | 0 9 * * 1-5"), "{listed}");
+        assert_eq!(
+            go(json!({"action": "list"}), &cx("b", true)).unwrap(),
+            "no routines"
+        );
+        assert!(go(json!({"action": "delete", "id": 1}), &cx("b", true)).is_err());
+        assert_eq!(
+            go(json!({"action": "delete", "id": "1"}), &a).unwrap(),
+            "deleted routine 1"
+        );
+        assert!(go(json!({"name": "x"}), &a).is_err());
+        assert_eq!(t.schema()["required"], json!(["action"]));
     }
 
     #[test]

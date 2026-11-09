@@ -19,9 +19,14 @@ The goal is simple: keep the engine efficient, so the model gets the machine's m
 - **Keep the prompt opening identical** so the model server can reuse its cache.
 - **The engine owns tool calling.** Probe the server, pick native tools, forced JSON or a text
   protocol, check every call, retry once with the error, then stop and say why.
-- **Set everything explicitly.** Thinking and sampling settings are sent on every request.
-- **Lock down each command.** `run` uses a fresh Landlock-confined process: workspace only, no TCP,
-  CPU and memory limits, never as root. If it can't be confined, it doesn't run.
+- **Set everything explicitly.** Thinking and sampling settings are sent on every request. On
+  Ollama the engine uses its native chat API so it can also set `think` and the context length:
+  the model's own limit, capped at 32k tokens and by what the machine's memory can hold.
+  Reasoning is never shown as a reply; a model that cannot stop thinking keeps it in its own field.
+- **Lock down each command.** `run` uses a fresh confined process (Landlock on Linux, a
+  deny-by-default `sandbox-exec` profile on macOS): writes only to the workspace and its temp
+  folder, no network, CPU and memory limits, never as root. If it can't be confined, it doesn't
+  run; Windows has no sandbox yet, so `run` is refused there.
 
 ## Benchmark (v0.0.1, November 2026)
 
@@ -67,10 +72,14 @@ loopback and needs `NEXY_ENGINE_KEY` to listen anywhere else.
 
 - `POST /v1/chat/completions`: OpenAI-shaped. The engine keeps each session's history; only the
   last user message is read. `"research": true` makes the engine search and read the top pages
-  before the model answers. Links in a message are always read first.
+  before the model answers. Links in a message are always read first. With `"stream": true` the
+  reply streams as server-sent events as the model writes it; tool calls and reasoning are held
+  back, tool use shows as `: tool <name>` comments, and the last event carries `usage` and `nexy`.
 - `POST /v1/responses` and `GET /v1/uhp`: the [Unified Harness Protocol](https://unifiedharnessprotocol.org)
   (core class, version 2026-10-19). Each bot is a harness.
-- `/api/sessions`, `/api/jobs`: history and scheduled tasks.
+- `/api/sessions`, `/api/jobs`: history and scheduled tasks (routines). A schedule is `every 30m`,
+  `daily 08:00` or standard 5-field cron such as `0 9 * * 1-5`, all in UTC. Bots with the
+  `routine` tool can also create, list and delete routines in chat.
 - `x-nexy-user`: the user a request acts for, set by the trusted caller. Sessions, memory, jobs and
   workspaces are kept per user.
 - `/health` answers `{"ok":true}`; details need the key.

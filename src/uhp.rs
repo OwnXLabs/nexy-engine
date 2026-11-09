@@ -487,6 +487,7 @@ async fn create(
                 workspace: None,
                 cancel: Some(&t.cancel),
                 progress: Some(&progress),
+                on_text: None,
             },
         );
         t.finish(res);

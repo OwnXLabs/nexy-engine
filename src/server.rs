@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 type S = State<Arc<App>>;
 
@@ -222,7 +222,11 @@ async fn chat(
     let a = app.clone();
     let s2 = session.clone();
     let research = body.research;
-    let res = tokio::task::spawn_blocking(move || {
+    let created = now();
+    let id = format!("chatcmpl-{created}");
+    let turn = move |on_text: Option<&dyn Fn(&str)>,
+                     progress: Option<&agent::Progress>,
+                     cancel: Option<&AtomicBool>| {
         agent::run(
             &a,
             &bot,
@@ -234,39 +238,87 @@ async fn chat(
                 owner: true,
                 research,
                 workspace: None,
-                cancel: None,
-                progress: None,
+                cancel,
+                progress,
+                on_text,
             },
         )
-    })
-    .await;
+    };
 
-    let created = now();
-    let id = format!("chatcmpl-{created}");
-    let (content, finish, extra) = match res {
+    if body.stream {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (id, model) = (id.clone(), name.clone());
+        let chunk = move |delta: Value, finish: Value| {
+            json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+        };
+        let _ = tx.send(sse(&chunk(
+            json!({"role": "assistant", "content": ""}),
+            Value::Null,
+        )));
+        tokio::task::spawn_blocking(move || {
+            let gone = AtomicBool::new(false);
+            let send = |s: String| {
+                if tx.send(s).is_err() {
+                    gone.store(true, Ordering::Relaxed);
+                }
+            };
+            let text = |t: &str| send(sse(&chunk(json!({"content": t}), Value::Null)));
+            let progress =
+                |c: &crate::model::RawCall, _: &str| send(format!(": tool {}\n\n", c.name));
+            let (_, finish, extra) = outcome(Ok(turn(Some(&text), Some(&progress), Some(&gone))));
+            let mut last = chunk(json!({}), json!(finish));
+            last["usage"] = usage_of(&extra);
+            last["nexy"] = extra;
+            last["session"] = json!(session);
+            send(sse(&last));
+            send("data: [DONE]\n\n".into());
+        });
+        let events = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|s| (Ok::<_, std::convert::Infallible>(s), rx))
+        });
+        return (
+            [
+                ("content-type", "text/event-stream"),
+                ("cache-control", "no-cache"),
+            ],
+            axum::body::Body::from_stream(events),
+        )
+            .into_response();
+    }
+
+    let res = tokio::task::spawn_blocking(move || turn(None, None, None)).await;
+    let (content, finish, extra) = outcome(res.map_err(|e| e.to_string()));
+    let usage = usage_of(&extra);
+    Json(json!({"id": id, "object": "chat.completion", "created": created, "model": name,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
+        "usage": usage, "nexy": extra, "session": session}))
+    .into_response()
+}
+
+fn outcome(res: Result<Result<agent::Turn, String>, String>) -> (String, &'static str, Value) {
+    match res {
         Ok(Ok(t)) => (
             t.reply.clone(),
             "stop",
             json!({"steps": t.steps, "tools": t.tools, "mode": t.mode,
             "usage": {"prompt_tokens": t.prompt_tokens, "completion_tokens": t.completion_tokens}}),
         ),
-        Ok(Err(e)) => (String::new(), "error", json!({"error": e})),
-        Err(e) => (String::new(), "error", json!({"error": e.to_string()})),
-    };
-    let usage = extra
+        Ok(Err(e)) | Err(e) => (String::new(), "error", json!({"error": e})),
+    }
+}
+
+fn usage_of(extra: &Value) -> Value {
+    extra
         .get("usage")
         .cloned()
-        .unwrap_or(json!({"prompt_tokens": 0, "completion_tokens": 0}));
-    if body.stream {
-        let chunk = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": name,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": finish}], "usage": usage});
-        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
-        return ([("content-type", "text/event-stream")], sse).into_response();
-    }
-    Json(json!({"id": id, "object": "chat.completion", "created": created, "model": name,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
-        "usage": usage, "nexy": extra, "session": session}))
-    .into_response()
+        .unwrap_or(json!({"prompt_tokens": 0, "completion_tokens": 0}))
+}
+
+fn sse(v: &Value) -> String {
+    format!("data: {v}\n\n")
 }
 
 #[derive(Deserialize)]
