@@ -219,13 +219,14 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
         n += 1;
     }
     let mut repaired = false;
+    let budget = caps.prompt_chars(bot.max_tokens).min(PROMPT_CHARS);
 
     for step in 0..=bot.max_steps {
         r.live()?;
         if t0.elapsed() > Duration::from_secs(bot.max_secs) {
             return Err("the turn ran out of time".into());
         }
-        compact(&mut msgs);
+        compact(&mut msgs, budget);
         let final_step = step == bot.max_steps;
         let offer: Vec<&Tool> = if final_step {
             Vec::new()
@@ -360,12 +361,12 @@ fn untrusted(tool: &str, out: &str) -> String {
     )
 }
 
-fn compact(msgs: &mut [Value]) {
+fn compact(msgs: &mut [Value], budget: usize) {
     let total: usize = msgs
         .iter()
         .map(|m| m["content"].as_str().map_or(0, str::len))
         .sum();
-    if total <= PROMPT_CHARS {
+    if total <= budget {
         return;
     }
     let keep = msgs.len().saturating_sub(6);

@@ -57,10 +57,11 @@ fn build() -> Result<App, String> {
                 serde_json::from_str::<model::Caps>(&t).map_err(|e| format!("{}: {e}", f.display()))
             })
     });
-    if let Some(c) = fixed
-        .transpose()?
-        .or_else(|| read_caps(&cfg.data_dir).remove(&key))
-    {
+    if let Some(c) = fixed.transpose()?.or_else(|| {
+        read_caps(&cfg.data_dir)
+            .remove(&key)
+            .filter(|c| c.version == model::CAPS_VERSION)
+    }) {
         *backend.caps.write().unwrap() = c;
     }
     Ok(App {

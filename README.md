@@ -19,7 +19,10 @@ The goal is simple: keep the engine efficient, so the model gets the machine's m
 - **Keep the prompt opening identical** so the model server can reuse its cache.
 - **The engine owns tool calling.** Probe the server, pick native tools, forced JSON or a text
   protocol, check every call, retry once with the error, then stop and say why.
-- **Set everything explicitly.** Thinking and sampling settings are sent on every request.
+- **Set everything explicitly.** Thinking and sampling settings are sent on every request. On
+  Ollama the engine uses its native chat API so it can also set `think` and the context length:
+  the model's own limit, capped at 32k tokens and by what the machine's memory can hold.
+  Reasoning is never shown as a reply; a model that cannot stop thinking keeps it in its own field.
 - **Lock down each command.** `run` uses a fresh confined process (Landlock on Linux, a
   deny-by-default `sandbox-exec` profile on macOS): writes only to the workspace and its temp
   folder, no network, CPU and memory limits, never as root. If it can't be confined, it doesn't
