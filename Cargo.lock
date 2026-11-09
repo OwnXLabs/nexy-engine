@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "nexy-engine"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "axum",
  "futures-util",
