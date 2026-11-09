@@ -6,6 +6,10 @@ mod config;
 mod gate;
 mod model;
 mod protocol;
+#[cfg(unix)]
+mod sandbox;
+#[cfg(not(unix))]
+#[path = "sandbox_none.rs"]
 mod sandbox;
 mod scheduler;
 mod server;
