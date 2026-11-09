@@ -1,6 +1,6 @@
 [package]
 name = "nexy-engine"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "A small, sandboxed agent engine for local models"
 license = "MIT"
