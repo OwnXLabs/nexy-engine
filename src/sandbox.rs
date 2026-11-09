@@ -15,6 +15,8 @@ const LIMITS: &str = if ULIMIT_MEMORY {
 
 pub fn run(ws: &Path, tmp: &Path, cmd: &str, limit: Duration) -> Result<String, String> {
     std::fs::create_dir_all(tmp).map_err(|e| e.to_string())?;
+    let ws = &ws.canonicalize().map_err(|e| format!("workspace: {e}"))?;
+    let tmp = &tmp.canonicalize().map_err(|e| format!("tmp: {e}"))?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut child = Command::new(exe)
         .arg("sandbox-exec")
@@ -114,20 +116,27 @@ fn group_rss_kb(pgid: u32) -> u64 {
         .sum()
 }
 
-fn is_root(tmp: &Path) -> bool {
+fn uid(tmp: &Path) -> std::io::Result<u32> {
     use std::os::unix::fs::MetadataExt;
     let probe = tmp.join(".uid");
     let uid = std::fs::write(&probe, b"")
         .and_then(|_| std::fs::metadata(&probe))
         .map(|m| m.uid());
     let _ = std::fs::remove_file(&probe);
-    uid.map_or(true, |u| u == 0)
+    uid
 }
 
 pub fn exec_confined(ws: &str, tmp: &str, cmd: &str) -> i32 {
-    if is_root(Path::new(tmp)) && std::env::var("NEXY_ENGINE_ALLOW_ROOT").as_deref() != Ok("1") {
-        eprintln!("refused: commands do not run as root; run the engine as an ordinary user");
-        return 126;
+    match uid(Path::new(tmp)) {
+        Err(e) => {
+            eprintln!("refused: cannot use the temp folder {tmp}: {e}");
+            return 126;
+        }
+        Ok(0) if std::env::var("NEXY_ENGINE_ALLOW_ROOT").as_deref() != Ok("1") => {
+            eprintln!("refused: commands do not run as root; run the engine as an ordinary user");
+            return 126;
+        }
+        Ok(_) => {}
     }
     let script = format!("{LIMITS}{cmd}");
     let mut c = match confine(Path::new(ws), Path::new(tmp), &script) {
