@@ -152,3 +152,34 @@ fn no_network() {
     assert!(!text.contains("rc=0"), "{text}");
     std::fs::remove_dir_all(&d.base).unwrap();
 }
+
+#[test]
+fn nothing_outlives_the_command() {
+    let d = dirs("bg");
+    let marker = d.ws.join("late.txt");
+    let cmd = format!("(sleep 3; echo late > {}) & echo started", marker.display());
+    let t0 = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_nexy-engine"))
+        .args(["sandbox-run"])
+        .arg(&d.ws)
+        .arg(&d.tmp)
+        .arg(&cmd)
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    if unavailable(&text) {
+        return;
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "a background child held the call open: {text}"
+    );
+    assert!(text.contains("started"), "{text}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "a background child kept running after the call"
+    );
+    let _ = std::fs::remove_dir_all(&d.base);
+}

@@ -135,6 +135,19 @@ fn main() {
     if args.first().map(String::as_str) == Some("sandbox-exec") && args.len() == 4 {
         std::process::exit(sandbox::exec_confined(&args[1], &args[2], &args[3]));
     }
+    if args.first().map(String::as_str) == Some("sandbox-run") && args.len() == 4 {
+        let r = sandbox::run(
+            std::path::Path::new(&args[1]),
+            std::path::Path::new(&args[2]),
+            &args[3],
+            std::time::Duration::from_secs(120),
+        );
+        match r {
+            Ok(o) => print!("{o}"),
+            Err(e) => eprintln!("{e}"),
+        }
+        std::process::exit(0);
+    }
     if args.first().map(String::as_str) == Some("idle-memory") {
         std::process::exit(idle_memory(
             args.get(1).and_then(|n| n.parse().ok()).unwrap_or(10_000),

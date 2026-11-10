@@ -476,16 +476,17 @@ pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
             })
             .map_err(|e| e.to_string()),
         "write_file" => {
-            let p = inside(&cx.workspace, &s("path"))?;
-            if let Some(d) = p.parent() {
-                std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+            let (d, p) = beneath(&cx.workspace, &s("path"))?;
+            if let Some(up) = p.parent().filter(|u| !u.as_os_str().is_empty()) {
+                d.create_dir_all(up).map_err(|e| e.to_string())?;
             }
-            std::fs::write(&p, s("content"))
+            d.write(&p, s("content"))
                 .map(|_| format!("wrote {}", s("path")))
                 .map_err(|e| e.to_string())
         }
         "read_file" => {
-            std::fs::read_to_string(inside(&cx.workspace, &s("path"))?).map_err(|e| e.to_string())
+            let (d, p) = beneath(&cx.workspace, &s("path"))?;
+            d.read_to_string(&p).map_err(|e| e.to_string())
         }
         "list_files" => {
             let mut names = Vec::new();
@@ -497,11 +498,12 @@ pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
             })
         }
         "edit_file" => {
-            let p = inside(&cx.workspace, &s("path"))?;
-            let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
+            let (d, p) = beneath(&cx.workspace, &s("path"))?;
+            let text = d.read_to_string(&p).map_err(|e| e.to_string())?;
             let old = s("old");
             match text.matches(old.as_str()).count() {
-                1 => std::fs::write(&p, text.replacen(old.as_str(), &s("new"), 1))
+                1 => d
+                    .write(&p, text.replacen(old.as_str(), &s("new"), 1))
                     .map(|_| format!("edited {}", s("path")))
                     .map_err(|e| e.to_string()),
                 0 => Err(format!(
@@ -535,6 +537,15 @@ pub fn cap(s: &str) -> String {
         end -= 1;
     }
     format!("{}\n[truncated: {} more bytes]", &s[..end], s.len() - end)
+}
+
+/// The workspace as a directory handle and the checked relative path: every open resolves beneath the
+/// handle, so a link swapped in after the check still cannot lead outside it.
+fn beneath(root: &Path, rel: &str) -> Result<(cap_std::fs::Dir, PathBuf), String> {
+    inside(root, rel)?;
+    let d = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+        .map_err(|e| format!("workspace: {e}"))?;
+    Ok((d, PathBuf::from(rel)))
 }
 
 fn inside(root: &Path, rel: &str) -> Result<PathBuf, String> {
@@ -807,6 +818,20 @@ mod tests {
         assert!(inside(r, "/etc/passwd").is_err());
         assert!(inside(r, "").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_swapped_in_after_the_check_still_cannot_escape() {
+        let base = std::env::temp_dir().join(format!("ne-race-{}", std::process::id()));
+        let (ws, out) = (base.join("ws"), base.join("out"));
+        std::fs::create_dir_all(ws.join("d")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let (d, p) = beneath(&ws, "d/x.txt").unwrap();
+        std::fs::remove_dir(ws.join("d")).unwrap();
+        std::os::unix::fs::symlink(&out, ws.join("d")).unwrap();
+        assert!(d.write(&p, "escaped").is_err());
+        assert!(!out.join("x.txt").exists());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

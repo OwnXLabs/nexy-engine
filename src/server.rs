@@ -37,7 +37,27 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
+/// Without a key the engine serves loopback only, so a request naming any other host came through
+/// a web page that rebound its own name to 127.0.0.1.
+fn loopback_host(headers: &HeaderMap) -> bool {
+    let Some(h) = headers.get("host").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let name = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        h.rsplit_once(':').map_or(h, |(n, _)| n)
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
 pub fn authorized(app: &App, headers: &HeaderMap) -> bool {
+    if app.cfg.api_key.is_none() {
+        return loopback_host(headers);
+    }
     app.cfg.api_key.as_ref().is_none_or(|key| {
         headers
             .get("authorization")
@@ -417,6 +437,32 @@ async fn delete_job(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyless_engine_answers_only_its_loopback_name() {
+        let h = |v: &str| {
+            let mut m = axum::http::HeaderMap::new();
+            m.insert("host", v.parse().unwrap());
+            m
+        };
+        for ok in [
+            "127.0.0.1:7300",
+            "localhost:7300",
+            "[::1]:7300",
+            "LOCALHOST",
+        ] {
+            assert!(super::loopback_host(&h(ok)), "{ok}");
+        }
+        for bad in [
+            "evil.example:7300",
+            "127.0.0.1.evil.example",
+            "[::2]:7300",
+            "nexy.box.lan",
+        ] {
+            assert!(!super::loopback_host(&h(bad)), "{bad}");
+        }
+        assert!(!super::loopback_host(&axum::http::HeaderMap::new()));
+    }
+
     use super::{safe_id, same};
 
     #[test]
