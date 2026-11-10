@@ -113,7 +113,7 @@ pub fn ensure_probed(app: &App) -> bool {
     {
         return false;
     }
-    eprintln!("probing {} ({})...", app.cfg.model_url, app.cfg.model);
+    eprintln!("probing {} ({})...", origin(&app.cfg.model_url), app.cfg.model);
     let _slot = app.gate.acquire(true);
     match probe(app) {
         Ok(c) => {
@@ -128,6 +128,12 @@ pub fn ensure_probed(app: &App) -> bool {
             false
         }
     }
+}
+
+/// A model URL for the log: scheme and host only, since a path can carry a secret.
+fn origin(url: &str) -> &str {
+    let rest = url.find("://").map_or(0, |i| i + 3);
+    url[rest..].find('/').map_or(url, |i| &url[..rest + i])
 }
 
 fn main() {
@@ -295,7 +301,7 @@ async fn serve(app: Arc<App>) -> i32 {
         "nexy-engine {} on http://{addr} (model {} at {}, bots {:?})",
         env!("CARGO_PKG_VERSION"),
         app.cfg.model,
-        app.cfg.model_url,
+        origin(&app.cfg.model_url),
         app.bots.keys().collect::<Vec<_>>()
     );
     let shutdown = async {
@@ -309,4 +315,13 @@ async fn serve(app: Arc<App>) -> i32 {
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod log_tests {
+    #[test]
+    fn model_urls_are_logged_without_their_path() {
+        assert_eq!(super::origin("http://127.0.0.1:5000/s3cr3t/v1"), "http://127.0.0.1:5000");
+        assert_eq!(super::origin("http://127.0.0.1:11434"), "http://127.0.0.1:11434");
+    }
 }
