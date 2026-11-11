@@ -1,5 +1,5 @@
 use crate::App;
-use crate::store::now;
+use crate::store::{Job, PENDING, now};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,14 +148,18 @@ impl Cron {
     }
 }
 
+/// Jobs to run now. A pending job never runs, even with a next run set.
+pub fn due(jobs: Vec<Job>, at: i64) -> Vec<Job> {
+    jobs.into_iter()
+        .filter(|j| j.enabled && j.status != PENDING && j.next_run_at.is_some_and(|t| t <= at))
+        .collect()
+}
+
 pub async fn run(app: Arc<App>) {
     loop {
         tokio::time::sleep(Duration::from_secs(20)).await;
         let due: Vec<_> = match app.store.jobs(None) {
-            Ok(j) => j
-                .into_iter()
-                .filter(|j| j.enabled && j.next_run_at.is_some_and(|t| t <= now()))
-                .collect(),
+            Ok(j) => due(j, now()),
             Err(e) => {
                 eprintln!("scheduler: cannot read jobs: {e}");
                 continue;
@@ -211,7 +215,26 @@ pub async fn run(app: Arc<App>) {
 
 #[cfg(test)]
 mod tests {
-    use super::next_run;
+    use super::{due, next_run};
+    use crate::store::{PENDING, Store};
+
+    #[test]
+    fn pending_jobs_never_run() {
+        let s = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let live = s
+            .add_job("a", "nexy", "live", "every 1h", "p", Some(10))
+            .unwrap();
+        let wait = s
+            .add_pending_job("a", "nexy", "wait", "every 1h", "p", "read_page")
+            .unwrap();
+        let mut jobs = s.jobs(None).unwrap();
+        jobs[1].next_run_at = Some(10);
+        assert_eq!(jobs[1].status, PENDING);
+        let ids: Vec<i64> = due(jobs, 100).iter().map(|j| j.id).collect();
+        assert_eq!(ids, vec![live], "pending job {wait} was due");
+        s.confirm_job("a", wait, 50).unwrap();
+        assert_eq!(due(s.jobs(None).unwrap(), 100).len(), 2);
+    }
 
     #[test]
     fn schedules() {
