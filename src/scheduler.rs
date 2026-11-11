@@ -192,6 +192,7 @@ pub async fn run(app: Arc<App>) {
                                 session: &session,
                                 text: &job.prompt,
                                 context: None,
+                                outside: false,
                                 owner: false,
                                 research: None,
                                 workspace: None,

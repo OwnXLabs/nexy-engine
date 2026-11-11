@@ -468,6 +468,8 @@ async fn create(
     app.tasks.put(task.clone());
     let instructions = body["instructions"].as_str().map(String::from);
     let research = body["metadata"]["research"].as_bool();
+    // instructions count as outside content unless the caller vouches for them
+    let clean = body["metadata"]["context_clean"].as_bool() == Some(true);
     let (a, t) = (app.clone(), task.clone());
     let job = tokio::task::spawn_blocking(move || {
         let Some(bot) = a.bots.get(&t.bot) else {
@@ -482,6 +484,7 @@ async fn create(
                 session: &t.session,
                 text: &text,
                 context: instructions.as_deref(),
+                outside: !clean,
                 owner: true,
                 research,
                 workspace: None,

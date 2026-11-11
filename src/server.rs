@@ -180,6 +180,9 @@ struct ChatBody {
     stream: bool,
     #[serde(default)]
     research: Option<bool>,
+    /// the caller vouches that its system message holds no outside content
+    #[serde(default)]
+    context_clean: bool,
 }
 
 async fn chat(
@@ -239,6 +242,7 @@ async fn chat(
         return err(StatusCode::NOT_FOUND, "no such session");
     }
 
+    let outside = context.as_deref().is_some_and(|c| !c.trim().is_empty()) && !body.context_clean;
     let a = app.clone();
     let s2 = session.clone();
     let research = body.research;
@@ -255,6 +259,7 @@ async fn chat(
                 session: &s2,
                 text: &user_text,
                 context: context.as_deref(),
+                outside,
                 owner: true,
                 research,
                 workspace: None,

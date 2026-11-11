@@ -113,7 +113,11 @@ pub fn ensure_probed(app: &App) -> bool {
     {
         return false;
     }
-    eprintln!("probing {} ({})...", origin(&app.cfg.model_url), app.cfg.model);
+    eprintln!(
+        "probing {} ({})...",
+        origin(&app.cfg.model_url),
+        app.cfg.model
+    );
     let _slot = app.gate.acquire(true);
     match probe(app) {
         Ok(c) => {
@@ -220,6 +224,7 @@ fn ask(app: &App, args: &[String]) -> i32 {
             session: &session,
             text: &words.join(" "),
             context: None,
+            outside: false,
             owner: true,
             research: None,
             workspace: workspace.as_deref(),
@@ -321,7 +326,13 @@ async fn serve(app: Arc<App>) -> i32 {
 mod log_tests {
     #[test]
     fn model_urls_are_logged_without_their_path() {
-        assert_eq!(super::origin("http://127.0.0.1:5000/s3cr3t/v1"), "http://127.0.0.1:5000");
-        assert_eq!(super::origin("http://127.0.0.1:11434"), "http://127.0.0.1:11434");
+        assert_eq!(
+            super::origin("http://127.0.0.1:5000/s3cr3t/v1"),
+            "http://127.0.0.1:5000"
+        );
+        assert_eq!(
+            super::origin("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434"
+        );
     }
 }

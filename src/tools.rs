@@ -1,6 +1,7 @@
 use crate::model::RawCall;
-use crate::store::Store;
+use crate::store::{PENDING, Store};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -378,6 +379,71 @@ pub struct Ctx<'a> {
     pub tmp: PathBuf,
     pub searxng: Option<&'a str>,
     pub owner: bool,
+    /// outside content in this turn's context; empty means only the owner's own words
+    pub outside: Vec<String>,
+    /// lines the reply must carry to the owner
+    pub notes: RefCell<Vec<String>>,
+}
+
+impl Tool {
+    /// Output that may carry someone else's words: fetched, run, or read back from storage.
+    pub fn taints(&self) -> bool {
+        self.external || matches!(self.name, "read_file" | "recall")
+    }
+}
+
+impl Ctx<'_> {
+    pub fn saw(&mut self, tool: &Tool, args: &Value) {
+        if !tool.taints() {
+            return;
+        }
+        let what = match args["url"].as_str() {
+            Some(u) => format!("{} {u}", tool.name),
+            None => tool.name.to_string(),
+        };
+        if !self.outside.contains(&what) {
+            self.outside.push(what);
+        }
+    }
+}
+
+/// Outside content already in context before this turn's tools run.
+pub fn outside_before(
+    store: &Store,
+    session: &str,
+    passed_in: bool,
+) -> rusqlite::Result<Vec<String>> {
+    let mut v = Vec::new();
+    if passed_in {
+        v.push("content passed in with the message".to_string());
+    }
+    // history keeps the replies built on earlier tool output, so any of it taints the chat
+    if store
+        .tools_used(session)?
+        .iter()
+        .any(|n| find(n).is_none_or(Tool::taints))
+    {
+        v.push("earlier in this chat".to_string());
+    }
+    Ok(v)
+}
+
+pub fn fence(tool: &str, out: &str) -> String {
+    format!(
+        "<untrusted source=\"{tool}\">\n{}\n</untrusted>",
+        out.replace("</untrusted>", "</ untrusted>")
+    )
+}
+
+/// Adds what tools asked to tell the owner, unless the reply already points them to it.
+pub fn with_notes(cx: &Ctx, text: &mut String) {
+    if text.contains("Routines") {
+        return;
+    }
+    for n in cx.notes.borrow().iter() {
+        text.push_str("\n\n");
+        text.push_str(n);
+    }
 }
 
 fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
@@ -392,11 +458,18 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                 .iter()
                 .map(|j| {
                     format!(
-                        "id {}: {} | {} | next {} | {}",
+                        "id {}: {} | {} | {} | {}",
                         j.id,
                         j.name,
                         j.schedule,
-                        j.next_run_at.map_or("-".into(), crate::store::utc_at),
+                        if j.status == PENDING {
+                            "waiting for the user to confirm it".into()
+                        } else {
+                            format!(
+                                "next {}",
+                                j.next_run_at.map_or("-".into(), crate::store::utc_at)
+                            )
+                        },
                         j.prompt
                     )
                 })
@@ -417,6 +490,21 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                 name
             };
             let next = crate::scheduler::next_run(&schedule, crate::store::now())?;
+            // outside content can ask for a routine; only the owner can make it run
+            if !cx.outside.is_empty() {
+                let origin: String = cx.outside.join(", ").chars().take(300).collect();
+                let id = cx
+                    .store
+                    .add_pending_job(cx.user, cx.bot, &name, &schedule, &prompt, &origin)
+                    .map_err(|e| e.to_string())?;
+                cx.notes.borrow_mut().push(format!(
+                    "The routine \"{name}\" is waiting for you in Routines. It will not run until you confirm it there."
+                ));
+                return Ok(format!(
+                    "saved routine {id} \"{name}\" ({schedule}) but it is NOT scheduled: this conversation holds outside content, \
+                     so the user must confirm it in Routines first. Tell the user it is waiting for their confirmation in Routines."
+                ));
+            }
             let id = cx
                 .store
                 .add_job(cx.user, cx.bot, &name, &schedule, &prompt, Some(next))
@@ -431,6 +519,11 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                 .as_i64()
                 .or_else(|| args["id"].as_str().and_then(|v| v.trim().parse().ok()))
                 .ok_or("delete needs the routine \"id\"; list them first")?;
+            if !cx.outside.is_empty() {
+                return Err("not deleted: this conversation holds outside content, so only the user can delete a routine now. \
+                     Tell them they can delete it in Routines."
+                    .into());
+            }
             match cx
                 .store
                 .delete_job(cx.user, id)
@@ -969,6 +1062,8 @@ mod tests {
             tmp: std::env::temp_dir(),
             searxng: None,
             owner,
+            outside: Vec::new(),
+            notes: Default::default(),
         };
         let t = find("routine").unwrap();
         let go = |args: Value, c: &Ctx| {
@@ -1012,6 +1107,142 @@ mod tests {
         assert!(go(json!({"name": "x"}), &a).is_err());
         assert_eq!(t.schema()["required"], json!(["action"]));
     }
+
+    fn clean<'a>(store: &'a Store) -> Ctx<'a> {
+        Ctx {
+            user: "a",
+            bot: "nexy",
+            store,
+            workspace: std::env::temp_dir(),
+            tmp: std::env::temp_dir(),
+            searxng: None,
+            owner: true,
+            outside: Vec::new(),
+            notes: Default::default(),
+        }
+    }
+
+    const MAKE: &str =
+        r#"{"action": "create", "name": "brief", "schedule": "every 1h", "prompt": "Brief me."}"#;
+
+    #[test]
+    fn tainted_create_waits_for_the_owner() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut cx = clean(&store);
+        let t = find("routine").unwrap();
+        cx.saw(
+            find("read_page").unwrap(),
+            &json!({"url": "https://a.example/x"}),
+        );
+        let out = run(t, &serde_json::from_str(MAKE).unwrap(), &cx).unwrap();
+        assert!(
+            out.contains("NOT scheduled") && out.contains("Routines"),
+            "{out}"
+        );
+        let j = &store.jobs(Some("a")).unwrap()[0];
+        assert_eq!((j.status.as_str(), j.next_run_at), (PENDING, None));
+        assert_eq!(j.origin.as_deref(), Some("read_page https://a.example/x"));
+        assert!(crate::scheduler::due(store.jobs(None).unwrap(), i64::MAX).is_empty());
+        let mut reply = "Done.".to_string();
+        with_notes(&cx, &mut reply);
+        assert!(reply.contains("waiting for you in Routines"), "{reply}");
+        let listed = run(t, &json!({"action": "list"}), &cx).unwrap();
+        assert!(
+            listed.contains("waiting for the user to confirm"),
+            "{listed}"
+        );
+        let del = run(t, &json!({"action": "delete", "id": j.id}), &cx);
+        assert!(del.is_err_and(|e| e.contains("only the user")));
+        assert_eq!(
+            store.jobs(Some("a")).unwrap().len(),
+            1,
+            "a tainted delete removed it"
+        );
+    }
+
+    #[test]
+    fn clean_create_is_scheduled() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let cx = clean(&store);
+        let out = run(
+            find("routine").unwrap(),
+            &serde_json::from_str(MAKE).unwrap(),
+            &cx,
+        )
+        .unwrap();
+        assert!(out.starts_with("created routine 1"), "{out}");
+        let j = &store.jobs(Some("a")).unwrap()[0];
+        assert_eq!(j.status, "active");
+        assert!(j.next_run_at.is_some());
+        assert!(cx.notes.borrow().is_empty());
+    }
+
+    #[test]
+    fn what_taints_a_turn() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut cx = clean(&store);
+        for n in ["remember", "write_file", "edit_file", "routine"] {
+            cx.saw(find(n).unwrap(), &json!({}));
+        }
+        assert!(cx.outside.is_empty(), "{:?}", cx.outside);
+        for n in [
+            "web_search",
+            "read_page",
+            "run",
+            "list_files",
+            "read_file",
+            "recall",
+        ] {
+            assert!(find(n).unwrap().taints(), "{n}");
+        }
+        assert!(outside_before(&store, "s", false).unwrap().is_empty());
+        assert_eq!(outside_before(&store, "s", true).unwrap().len(), 1);
+        store.ensure_session("a", "s", "nexy", "t", "api").unwrap();
+        store.append("s", "tool", "{}", Some("remember")).unwrap();
+        assert!(outside_before(&store, "s", false).unwrap().is_empty());
+        store.append("s", "tool", "{}", Some("web_search")).unwrap();
+        assert_eq!(
+            outside_before(&store, "s", false).unwrap(),
+            vec!["earlier in this chat"]
+        );
+        store.ensure_session("a", "u", "nexy", "t", "api").unwrap();
+        store.append("u", "tool", "{}", Some("gone_tool")).unwrap();
+        assert_eq!(
+            outside_before(&store, "u", false).unwrap().len(),
+            1,
+            "unknown tools taint"
+        );
+    }
+
+    #[test]
+    fn confirming_is_not_a_tool() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let cx = clean(&store);
+        let id = store
+            .add_pending_job("a", "nexy", "j", "every 1h", "p", "x")
+            .unwrap();
+        let t = find("routine").unwrap();
+        for action in ["confirm", "approve", "activate", "enable", "discard"] {
+            assert!(
+                run(t, &json!({"action": action, "id": id}), &cx).is_err(),
+                "{action}"
+            );
+        }
+        assert_eq!(store.job("a", id).unwrap().unwrap().status, PENDING);
+        for tool in ALL {
+            let all = format!("{} {} {:?}", tool.name, tool.desc, tool.schema());
+            assert!(
+                !all.to_lowercase().contains("confirm"),
+                "{} offers confirming",
+                tool.name
+            );
+        }
+        let body = &SRC[..SRC.find("#[cfg(test)]").unwrap()];
+        assert!(!body.contains("confirm_job"), "a tool reaches confirm_job");
+        assert!(public_host("http://127.0.0.1:8650/api/jobs/1/confirm").is_err());
+    }
+
+    const SRC: &str = include_str!("tools.rs");
 
     #[test]
     fn validates_args() {
