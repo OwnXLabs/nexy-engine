@@ -34,6 +34,28 @@ pub fn next_run(schedule: &str, from: i64) -> Result<i64, String> {
     c.after(from).ok_or_else(|| bad(schedule))
 }
 
+/// New routines run no more often than this.
+pub const MIN_GAP_MINS: i64 = 5;
+
+/// A schedule for a new routine: valid, and no more often than every MIN_GAP_MINS minutes.
+pub fn new_schedule(schedule: &str, from: i64) -> Result<i64, String> {
+    let next = next_run(schedule, from)?;
+    let s = schedule.trim().to_lowercase();
+    let gap = if s.starts_with("every ") {
+        (next - from) / 60
+    } else if s.starts_with("daily ") {
+        24 * 60
+    } else {
+        Cron::parse(&s).map_or(0, |c| c.min_gap())
+    };
+    if gap < MIN_GAP_MINS {
+        return Err(format!(
+            "\"{schedule}\" runs too often: routines run at most every {MIN_GAP_MINS} minutes"
+        ));
+    }
+    Ok(next)
+}
+
 fn bad(s: &str) -> String {
     format!(
         "unsupported schedule \"{s}\": use \"every 30m\", \"every 2h\", \"daily 08:00\" or 5-field cron such as \"0 9 * * 1-5\" (all UTC)"
@@ -107,6 +129,20 @@ impl Cron {
             dom_any: f[2] == "*",
             dow_any: f[4] == "*",
         })
+    }
+
+    /// Fewest minutes between two runs, counting across the hour.
+    fn min_gap(&self) -> i64 {
+        let mins: Vec<i64> = (0..60).filter(|m| self.minute & (1 << m) != 0).collect();
+        match (mins.first(), mins.last()) {
+            (Some(a), Some(z)) if mins.len() > 1 => mins
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .chain([60 - z + a])
+                .min()
+                .unwrap_or(60),
+            _ => 60,
+        }
     }
 
     fn day_matches(&self, days: i64) -> bool {
@@ -216,7 +252,7 @@ pub async fn run(app: Arc<App>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{due, next_run};
+    use super::{due, new_schedule, next_run};
     use crate::store::{PENDING, Store};
 
     #[test]
@@ -248,6 +284,43 @@ mod tests {
         assert_eq!(next_run("0 8 * * *", t).unwrap(), d);
         assert!(next_run("whenever", t).is_err());
         assert!(next_run("daily 25:00", t).is_err());
+    }
+
+    #[test]
+    fn new_routines_run_at_most_every_five_minutes() {
+        let t = 1_700_000_000;
+        for ok in [
+            "every 5m",
+            "every 1h",
+            "daily 08:00",
+            "*/5 * * * *",
+            "0 9 * * 1-5",
+            "0,30 * * * *",
+        ] {
+            assert!(new_schedule(ok, t).is_ok(), "{ok} was refused");
+        }
+        for fast in [
+            "every 1m",
+            "every 4m",
+            "* * * * *",
+            "*/2 * * * *",
+            "0,3 * * * *",
+            "0,58 * * * *",
+            "* 9 1 1 *",
+        ] {
+            let e = new_schedule(fast, t).unwrap_err();
+            assert!(e.contains("too often"), "{fast}: {e}");
+        }
+        assert!(
+            new_schedule("whenever", t)
+                .unwrap_err()
+                .contains("unsupported")
+        );
+        assert_eq!(
+            next_run("every 1m", t).unwrap(),
+            t + 60,
+            "existing routines still run"
+        );
     }
 
     const FRI_2026_11_06_1000: i64 = 1_793_959_200;

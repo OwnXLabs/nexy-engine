@@ -13,6 +13,8 @@ pub struct Config {
     pub slots: usize,
     pub api_key: Option<String>,
     pub caps_file: Option<PathBuf>,
+    /// extra Host names a keyless engine answers to, from NEXY_ENGINE_HOSTS (comma separated)
+    pub hosts: Vec<String>,
 }
 
 fn var(k: &str) -> Option<String> {
@@ -46,6 +48,14 @@ impl Config {
                 .max(1),
             api_key: var("NEXY_ENGINE_KEY"),
             caps_file: var("NEXY_ENGINE_CAPS_FILE").map(PathBuf::from),
+            hosts: var("NEXY_ENGINE_HOSTS")
+                .map(|v| {
+                    v.split(',')
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
