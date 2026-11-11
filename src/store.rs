@@ -38,9 +38,16 @@ pub struct Job {
     pub next_run_at: Option<i64>,
     pub last_run_at: Option<i64>,
     pub last_status: Option<String>,
+    /// "active", or "pending" until the owner confirms it
+    pub status: String,
+    /// outside content that was in context when it was made, if any
+    pub origin: Option<String>,
 }
 
+pub const PENDING: &str = "pending";
+
 pub const DEFAULT_USER: &str = "owner";
+const USER_COL: &str = "TEXT NOT NULL DEFAULT 'owner'";
 
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -88,16 +95,20 @@ impl Store {
              CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, bot TEXT NOT NULL, name TEXT NOT NULL, schedule TEXT NOT NULL,
                prompt TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, next_run_at INTEGER, last_run_at INTEGER, last_status TEXT);",
         )?;
-        for table in ["sessions", "memory", "jobs"] {
+        for (table, column, ddl) in [
+            ("sessions", "user", USER_COL),
+            ("memory", "user", USER_COL),
+            ("jobs", "user", USER_COL),
+            ("jobs", "status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("jobs", "origin", "TEXT"),
+        ] {
             let has: bool = db
                 .prepare(&format!(
-                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'user'"
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"
                 ))?
                 .exists([])?;
             if !has {
-                db.execute_batch(&format!(
-                    "ALTER TABLE {table} ADD COLUMN user TEXT NOT NULL DEFAULT '{DEFAULT_USER}'"
-                ))?;
+                db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"))?;
             }
         }
         Ok(Store { db: Mutex::new(db) })
@@ -249,10 +260,58 @@ impl Store {
         Ok(db.last_insert_rowid())
     }
 
+    /// Saved but not scheduled: no next run until the owner confirms it.
+    pub fn add_pending_job(
+        &self,
+        user: &str,
+        bot: &str,
+        name: &str,
+        schedule: &str,
+        prompt: &str,
+        origin: &str,
+    ) -> rusqlite::Result<i64> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+            params![user, bot, name, schedule, prompt, PENDING, origin],
+        )?;
+        Ok(db.last_insert_rowid())
+    }
+
+    pub fn job(&self, user: &str, id: i64) -> rusqlite::Result<Option<Job>> {
+        Ok(self.jobs(Some(user))?.into_iter().find(|j| j.id == id))
+    }
+
+    /// Owner only, through the API: a pending job becomes active with its first run.
+    pub fn confirm_job(&self, user: &str, id: i64, next: i64) -> rusqlite::Result<usize> {
+        self.db.lock().unwrap().execute(
+            "UPDATE jobs SET status = 'active', next_run_at = ?3 WHERE id = ?1 AND user = ?2 AND status = ?4",
+            params![id, user, next, PENDING],
+        )
+    }
+
+    pub fn discard_job(&self, user: &str, id: i64) -> rusqlite::Result<usize> {
+        self.db.lock().unwrap().execute(
+            "DELETE FROM jobs WHERE id = ?1 AND user = ?2 AND status = ?3",
+            params![id, user, PENDING],
+        )
+    }
+
+    /// Names of the tools that ran in a session, oldest turns included.
+    pub fn tools_used(&self, session: &str) -> rusqlite::Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(
+            "SELECT DISTINCT COALESCE(tool_name, '') FROM messages WHERE session_id = ?1 AND role = 'tool'",
+        )?;
+        let rows = st.query_map(params![session], |r| r.get(0))?;
+        rows.collect()
+    }
+
     pub fn jobs(&self, user: Option<&str>) -> rusqlite::Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(
-            "SELECT id, user, bot, name, schedule, prompt, enabled, next_run_at, last_run_at, last_status FROM jobs
+            "SELECT id, user, bot, name, schedule, prompt, enabled, next_run_at, last_run_at, last_status, status, origin FROM jobs
              WHERE ?1 IS NULL OR user = ?1 ORDER BY id",
         )?;
         let rows = st.query_map(params![user], |r| {
@@ -267,6 +326,8 @@ impl Store {
                 next_run_at: r.get(7)?,
                 last_run_at: r.get(8)?,
                 last_status: r.get(9)?,
+                status: r.get(10)?,
+                origin: r.get(11)?,
             })
         })?;
         rows.collect()
@@ -274,7 +335,7 @@ impl Store {
 
     pub fn finish_job(&self, id: i64, status: &str, next: Option<i64>) -> rusqlite::Result<()> {
         self.db.lock().unwrap().execute(
-            "UPDATE jobs SET last_run_at = ?2, last_status = ?3, next_run_at = ?4 WHERE id = ?1",
+            "UPDATE jobs SET last_run_at = ?2, last_status = ?3, next_run_at = ?4 WHERE id = ?1 AND status = 'active'",
             params![id, now(), status, next],
         )?;
         Ok(())
@@ -315,5 +376,69 @@ mod tests {
         assert_eq!(s.messages("s1", 10).unwrap().len(), 1);
         assert_eq!(s.delete_session("a", "s1").unwrap(), 1);
         assert!(s.messages("s1", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_jobs_wait_for_confirm_or_discard() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        let id = s
+            .add_pending_job("a", "nexy", "j", "every 1h", "p", "read_page")
+            .unwrap();
+        let j = s.job("a", id).unwrap().unwrap();
+        assert_eq!((j.status.as_str(), j.next_run_at), (PENDING, None));
+        assert_eq!(j.origin.as_deref(), Some("read_page"));
+        s.finish_job(id, "ok", Some(5)).unwrap();
+        assert_eq!(s.job("a", id).unwrap().unwrap().next_run_at, None);
+        assert_eq!(s.confirm_job("b", id, 99).unwrap(), 0);
+        assert_eq!(s.confirm_job("a", id, 99).unwrap(), 1);
+        let j = s.job("a", id).unwrap().unwrap();
+        assert_eq!((j.status.as_str(), j.next_run_at), ("active", Some(99)));
+        assert_eq!(s.confirm_job("a", id, 5).unwrap(), 0, "confirms once");
+        assert_eq!(
+            s.discard_job("a", id).unwrap(),
+            0,
+            "discard is for pending only"
+        );
+        let p = s
+            .add_pending_job("a", "nexy", "k", "every 1h", "p", "x")
+            .unwrap();
+        assert_eq!(s.discard_job("b", p).unwrap(), 0);
+        assert_eq!(s.discard_job("a", p).unwrap(), 1);
+        assert!(s.job("a", p).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_database_gains_status_and_keeps_its_jobs() {
+        let path = std::env::temp_dir().join(format!("nexy-old-{}.db", std::process::id()));
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE jobs(id INTEGER PRIMARY KEY, bot TEXT NOT NULL, name TEXT NOT NULL, schedule TEXT NOT NULL,
+                   prompt TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, next_run_at INTEGER, last_run_at INTEGER, last_status TEXT);
+                 INSERT INTO jobs(bot, name, schedule, prompt, next_run_at) VALUES ('nexy', 'brief', 'every 1h', 'p', 42);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let j = s.job(DEFAULT_USER, 1).unwrap().unwrap();
+        assert_eq!(
+            (j.status.as_str(), j.next_run_at, j.origin),
+            ("active", Some(42), None)
+        );
+        drop(s);
+        Store::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        for ext in ["-wal", "-shm"] {
+            let side = path.with_file_name(format!(
+                "{}{ext}",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            if side.exists() {
+                std::fs::remove_file(side).unwrap();
+            }
+        }
     }
 }
