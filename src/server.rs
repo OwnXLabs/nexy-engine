@@ -1,7 +1,7 @@
 use crate::App;
 use crate::agent::{self, Input};
 use crate::scheduler::next_run;
-use crate::store::{DEFAULT_USER, now};
+use crate::store::{DEFAULT_USER, PENDING, now};
 use axum::extract::{FromRequestParts, OriginalUri, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -26,6 +26,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/jobs", get(jobs).post(create_job))
         .route("/api/jobs/{id}", delete(delete_job))
+        .route("/api/jobs/{id}/confirm", post(confirm_job))
+        .route("/api/jobs/{id}/discard", post(discard_job))
         .route("/api/probe", post(probe));
     Router::new()
         .merge(api.clone())
@@ -37,7 +39,27 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
+/// Without a key the engine serves loopback only, so a request naming any other host came through
+/// a web page that rebound its own name to 127.0.0.1.
+fn loopback_host(headers: &HeaderMap) -> bool {
+    let Some(h) = headers.get("host").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let name = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        h.rsplit_once(':').map_or(h, |(n, _)| n)
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
 pub fn authorized(app: &App, headers: &HeaderMap) -> bool {
+    if app.cfg.api_key.is_none() {
+        return loopback_host(headers);
+    }
     app.cfg.api_key.as_ref().is_none_or(|key| {
         headers
             .get("authorization")
@@ -160,6 +182,9 @@ struct ChatBody {
     stream: bool,
     #[serde(default)]
     research: Option<bool>,
+    /// the caller vouches that its system message holds no outside content
+    #[serde(default)]
+    context_clean: bool,
 }
 
 async fn chat(
@@ -219,9 +244,11 @@ async fn chat(
         return err(StatusCode::NOT_FOUND, "no such session");
     }
 
+    let outside = context.as_deref().is_some_and(|c| !c.trim().is_empty()) && !body.context_clean;
     let a = app.clone();
     let s2 = session.clone();
     let research = body.research;
+    let started = std::time::Instant::now();
     let created = now();
     let id = format!("chatcmpl-{created}");
     let turn = move |on_text: Option<&dyn Fn(&str)>,
@@ -235,6 +262,7 @@ async fn chat(
                 session: &s2,
                 text: &user_text,
                 context: context.as_deref(),
+                outside,
                 owner: true,
                 research,
                 workspace: None,
@@ -248,6 +276,7 @@ async fn chat(
     if body.stream {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (id, model) = (id.clone(), name.clone());
+        let bot_log = name.clone();
         let chunk = move |delta: Value, finish: Value| {
             json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
@@ -267,6 +296,10 @@ async fn chat(
             let progress =
                 |c: &crate::model::RawCall, _: &str| send(format!(": tool {}\n\n", c.name));
             let (_, finish, extra) = outcome(Ok(turn(Some(&text), Some(&progress), Some(&gone))));
+            eprintln!(
+                "{}",
+                turn_line(&session, &bot_log, started.elapsed(), finish, &extra)
+            );
             let mut last = chunk(json!({}), json!(finish));
             last["usage"] = usage_of(&extra);
             last["nexy"] = extra;
@@ -291,6 +324,10 @@ async fn chat(
 
     let res = tokio::task::spawn_blocking(move || turn(None, None, None)).await;
     let (content, finish, extra) = outcome(res.map_err(|e| e.to_string()));
+    eprintln!(
+        "{}",
+        turn_line(&session, &name, started.elapsed(), finish, &extra)
+    );
     let usage = usage_of(&extra);
     Json(json!({"id": id, "object": "chat.completion", "created": created, "model": name,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
@@ -308,6 +345,39 @@ fn outcome(res: Result<Result<agent::Turn, String>, String>) -> (String, &'stati
         ),
         Ok(Err(e)) | Err(e) => (String::new(), "error", json!({"error": e})),
     }
+}
+
+/// One journal line per turn, for operators: ids, timing and counts, never prompt or reply text.
+fn turn_line(
+    session: &str,
+    bot: &str,
+    took: std::time::Duration,
+    finish: &str,
+    extra: &Value,
+) -> String {
+    let tools: Vec<&str> = extra["tools"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+        .unwrap_or_default();
+    let u = &extra["usage"];
+    let mut line = format!(
+        "turn session={session} bot={bot} ms={} result={finish} steps={} tools={} [{}] tokens={}/{} mode={}",
+        took.as_millis(),
+        extra["steps"].as_u64().unwrap_or(0),
+        tools.len(),
+        tools.join(","),
+        u["prompt_tokens"].as_u64().unwrap_or(0),
+        u["completion_tokens"].as_u64().unwrap_or(0),
+        extra["mode"].as_str().unwrap_or("-"),
+    );
+    if let Some(e) = extra["error"].as_str() {
+        // the class of failure, cut short: errors can quote model output
+        line.push_str(&format!(
+            " error={:?}",
+            e.chars().take(80).collect::<String>()
+        ));
+    }
+    line
 }
 
 fn usage_of(extra: &Value) -> Value {
@@ -408,8 +478,47 @@ async fn delete_job(
     User(user): User,
     Path(p): Path<HashMap<String, String>>,
 ) -> Response {
-    let id: i64 = p.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1);
-    match app.store.delete_job(&user, id) {
+    match app.store.delete_job(&user, job_id(&p)) {
+        Ok(n) => Json(json!({"deleted": n})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn job_id(p: &HashMap<String, String>) -> i64 {
+    p.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1)
+}
+
+/// The owner's yes to a pending routine. Only this API reaches it, never a tool.
+async fn confirm_job(
+    State(app): S,
+    User(user): User,
+    Path(p): Path<HashMap<String, String>>,
+) -> Response {
+    let id = job_id(&p);
+    let job = match app.store.job(&user, id) {
+        Ok(Some(j)) if j.status == PENDING => j,
+        Ok(_) => return err(StatusCode::NOT_FOUND, "no pending routine with that id"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let next = match next_run(&job.schedule, now()) {
+        Ok(n) => n,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+    };
+    match app.store.confirm_job(&user, id, next) {
+        Ok(0) => err(StatusCode::NOT_FOUND, "no pending routine with that id"),
+        Ok(_) => Json(json!({"job": {"id": id, "status": "active", "next_run_at": next}}))
+            .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn discard_job(
+    State(app): S,
+    User(user): User,
+    Path(p): Path<HashMap<String, String>>,
+) -> Response {
+    match app.store.discard_job(&user, job_id(&p)) {
+        Ok(0) => err(StatusCode::NOT_FOUND, "no pending routine with that id"),
         Ok(n) => Json(json!({"deleted": n})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -417,6 +526,60 @@ async fn delete_job(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turn_line_has_counts_and_no_text() {
+        let extra = serde_json::json!({"steps": 3, "tools": ["web_search", "read_page"], "mode": "native",
+            "usage": {"prompt_tokens": 812, "completion_tokens": 140}});
+        let l = super::turn_line(
+            "s-1",
+            "nexy",
+            std::time::Duration::from_millis(87_000),
+            "stop",
+            &extra,
+        );
+        assert_eq!(
+            l,
+            "turn session=s-1 bot=nexy ms=87000 result=stop steps=3 tools=2 [web_search,read_page] tokens=812/140 mode=native"
+        );
+        let failed = super::turn_line(
+            "s-2",
+            "nexy",
+            std::time::Duration::from_millis(5),
+            "error",
+            &serde_json::json!({"error": "model said: ".to_string() + &"x".repeat(500)}),
+        );
+        assert!(
+            failed.contains("result=error") && failed.len() < 220,
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn keyless_engine_answers_only_its_loopback_name() {
+        let h = |v: &str| {
+            let mut m = axum::http::HeaderMap::new();
+            m.insert("host", v.parse().unwrap());
+            m
+        };
+        for ok in [
+            "127.0.0.1:7300",
+            "localhost:7300",
+            "[::1]:7300",
+            "LOCALHOST",
+        ] {
+            assert!(super::loopback_host(&h(ok)), "{ok}");
+        }
+        for bad in [
+            "evil.example:7300",
+            "127.0.0.1.evil.example",
+            "[::2]:7300",
+            "nexy.box.lan",
+        ] {
+            assert!(!super::loopback_host(&h(bad)), "{bad}");
+        }
+        assert!(!super::loopback_host(&axum::http::HeaderMap::new()));
+    }
+
     use super::{safe_id, same};
 
     #[test]
@@ -429,5 +592,111 @@ mod tests {
         assert!(!safe_id("a/b"));
         assert!(!safe_id(""));
         assert!(!safe_id(&"x".repeat(129)));
+    }
+
+    fn test_app() -> crate::App {
+        crate::App {
+            cfg: crate::config::Config {
+                host: "127.0.0.1".into(),
+                port: 0,
+                model_url: "http://127.0.0.1:9".into(),
+                model: "m".into(),
+                model_key: None,
+                searxng_url: None,
+                data_dir: std::env::temp_dir(),
+                packs_dir: std::env::temp_dir(),
+                slots: 1,
+                api_key: None,
+                caps_file: None,
+            },
+            store: crate::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+            backend: crate::model::Backend::new("http://127.0.0.1:9", "m", None),
+            gate: crate::gate::Gate::new(1),
+            bots: Default::default(),
+            default_bot: "nexy".into(),
+            probe_tried: Default::default(),
+            tasks: Default::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_confirms_or_discards_a_pending_routine() {
+        let app = std::sync::Arc::new(test_app());
+        let wait = app
+            .store
+            .add_pending_job(
+                "owner",
+                "nexy",
+                "w",
+                "every 1h",
+                "Brief me.",
+                "read_page https://a.example",
+            )
+            .unwrap();
+        let drop_me = app
+            .store
+            .add_pending_job("owner", "nexy", "d", "every 1h", "p", "x")
+            .unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let srv = tokio::spawn(axum::serve(l, super::router(app.clone())).into_future());
+        let res = tokio::task::spawn_blocking(move || {
+            let call = |m: &str, path: &str, user: &str| -> (u16, serde_json::Value) {
+                let r = ureq::request(m, &format!("{base}{path}"))
+                    .set("x-nexy-user", user)
+                    .call();
+                let r = match r {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(_, r)) => r,
+                    Err(e) => panic!("{e}"),
+                };
+                let code = r.status();
+                let body = r.into_string().unwrap();
+                let v = if body.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(&body).unwrap()
+                };
+                (code, v)
+            };
+            let (_, list) = call("GET", "/api/jobs", "owner");
+            assert_eq!(list["jobs"][0]["status"], "pending");
+            assert_eq!(list["jobs"][0]["origin"], "read_page https://a.example");
+            assert_eq!(list["jobs"][0]["next_run_at"], serde_json::Value::Null);
+            assert_eq!(
+                call("POST", &format!("/api/jobs/{wait}/confirm"), "other").0,
+                404
+            );
+            assert_eq!(
+                call("POST", &format!("/api/jobs/{wait}/discard"), "other").0,
+                404
+            );
+            let (code, ok) = call("POST", &format!("/api/jobs/{wait}/confirm"), "owner");
+            assert_eq!(code, 200, "{ok}");
+            assert!(ok["job"]["next_run_at"].as_i64().is_some());
+            assert_eq!(
+                call("POST", &format!("/api/jobs/{wait}/confirm"), "owner").0,
+                404
+            );
+            assert_eq!(
+                call("POST", &format!("/api/jobs/{wait}/discard"), "owner").0,
+                404,
+                "active is not discarded"
+            );
+            assert_eq!(
+                call("GET", &format!("/api/jobs/{wait}/confirm"), "owner").0,
+                405
+            );
+            assert_eq!(
+                call("POST", &format!("/api/jobs/{drop_me}/discard"), "owner").0,
+                200
+            );
+        })
+        .await;
+        srv.abort();
+        res.unwrap();
+        let jobs = app.store.jobs(Some("owner")).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].id, jobs[0].status.as_str()), (wait, "active"));
     }
 }

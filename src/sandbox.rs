@@ -75,14 +75,14 @@ pub fn run(ws: &Path, tmp: &Path, cmd: &str, limit: Duration) -> Result<String, 
             over_memory = group_rss_kb(pid) > MEM_KB;
         }
         if over_memory || t0.elapsed() > limit {
-            let _ = Command::new("kill")
-                .args(["-9", &format!("-{pid}")])
-                .status();
+            kill_group(pid);
             let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    // nothing it started outlives the call: background children would hold its output open and keep acting
+    kill_group(pid);
     let (o, e) = (
         out.join().unwrap_or_default(),
         err.join().unwrap_or_default(),
@@ -99,6 +99,12 @@ pub fn run(ws: &Path, tmp: &Path, cmd: &str, limit: Duration) -> Result<String, 
         "[{code}]\n{o}{}{e}",
         if e.is_empty() { "" } else { "\n[stderr]\n" }
     ))
+}
+
+fn kill_group(pgid: u32) {
+    if let Some(p) = rustix::process::Pid::from_raw(pgid as i32) {
+        let _ = rustix::process::kill_process_group(p, rustix::process::Signal::KILL);
+    }
 }
 
 fn group_rss_kb(pgid: u32) -> u64 {
@@ -174,9 +180,9 @@ fn read_roots(base: &[&str], ws: &Path) -> Vec<PathBuf> {
 fn confine(ws: &Path, tmp: &Path, script: &str) -> Result<Command, String> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
-        path_beneath_rules,
+        Scope, path_beneath_rules,
     };
-    let abi = ABI::V5;
+    let abi = ABI::V6;
     let roots = read_roots(
         &[
             "/usr",
@@ -195,6 +201,7 @@ fn confine(ws: &Path, tmp: &Path, script: &str) -> Result<Command, String> {
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
         .and_then(|r| r.handle_access(AccessNet::from_all(abi)))
+        .and_then(|r| r.scope(Scope::from_all(abi)))
         .and_then(|r| r.create())
         .and_then(|r| r.add_rules(path_beneath_rules(roots, AccessFs::from_read(abi))))
         .and_then(|r| {
@@ -207,6 +214,13 @@ fn confine(ws: &Path, tmp: &Path, script: &str) -> Result<Command, String> {
         .map_err(|e| format!("sandbox setup failed: {e}"))?;
     if status.ruleset == RulesetStatus::NotEnforced {
         return Err("Landlock is not available on this kernel".into());
+    }
+    // below ABI 4 a command could open any TCP connection; below 6 it could signal the engine's other processes
+    if ABI::from(status.landlock) < ABI::V4 {
+        return Err(
+            "this kernel's Landlock cannot block network connections (needs Linux 6.7 or newer)"
+                .into(),
+        );
     }
     let mut c = Command::new("sh");
     c.arg("-c").arg(script);

@@ -36,6 +36,8 @@ pub struct Input<'a> {
     pub session: &'a str,
     pub text: &'a str,
     pub context: Option<&'a str>,
+    /// the context holds outside content (files, mail, pages), not only the owner's words
+    pub outside: bool,
     pub owner: bool,
     pub research: Option<bool>,
     pub workspace: Option<&'a std::path::Path>,
@@ -75,6 +77,7 @@ impl Run<'_> {
         self.live()?;
         let tool = tools::find(&c.name).ok_or("unknown tool")?;
         let out = tools::run(tool, &c.args, &self.cx).unwrap_or_else(|e| format!("error: {e}"));
+        self.cx.saw(tool, &c.args);
         let receipt = json!({"args": c.args, "result": tools::cap(&out)}).to_string();
         self.app
             .store
@@ -90,7 +93,7 @@ impl Run<'_> {
             self.read.push(u.to_string());
         }
         Ok(if tool.external {
-            untrusted(&c.name, &out)
+            tools::fence(&c.name, &out)
         } else {
             out
         })
@@ -191,6 +194,8 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
             tmp,
             searxng: app.cfg.searxng_url.as_deref(),
             owner: input.owner,
+            outside: tools::outside_before(store, input.session, input.outside).map_err(db)?,
+            notes: Default::default(),
         },
         session: input.session,
         turn: Turn {
@@ -297,6 +302,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
 
         match parsed {
             Ok(Step::Answer(mut text)) => {
+                tools::with_notes(&r.cx, &mut text);
                 if !r.read.is_empty() && !text.contains("http") {
                     text.push_str("\n\nSources:");
                     for u in &r.read {
@@ -352,13 +358,6 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
         }
     }
     Err("the turn ended without an answer".into())
-}
-
-fn untrusted(tool: &str, out: &str) -> String {
-    format!(
-        "<untrusted source=\"{tool}\">\n{}\n</untrusted>",
-        out.replace("</untrusted>", "</ untrusted>")
-    )
 }
 
 fn compact(msgs: &mut [Value], budget: usize) {
