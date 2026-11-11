@@ -242,6 +242,7 @@ async fn chat(
     let a = app.clone();
     let s2 = session.clone();
     let research = body.research;
+    let started = std::time::Instant::now();
     let created = now();
     let id = format!("chatcmpl-{created}");
     let turn = move |on_text: Option<&dyn Fn(&str)>,
@@ -268,6 +269,7 @@ async fn chat(
     if body.stream {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (id, model) = (id.clone(), name.clone());
+        let bot_log = name.clone();
         let chunk = move |delta: Value, finish: Value| {
             json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
@@ -287,6 +289,10 @@ async fn chat(
             let progress =
                 |c: &crate::model::RawCall, _: &str| send(format!(": tool {}\n\n", c.name));
             let (_, finish, extra) = outcome(Ok(turn(Some(&text), Some(&progress), Some(&gone))));
+            eprintln!(
+                "{}",
+                turn_line(&session, &bot_log, started.elapsed(), finish, &extra)
+            );
             let mut last = chunk(json!({}), json!(finish));
             last["usage"] = usage_of(&extra);
             last["nexy"] = extra;
@@ -311,6 +317,10 @@ async fn chat(
 
     let res = tokio::task::spawn_blocking(move || turn(None, None, None)).await;
     let (content, finish, extra) = outcome(res.map_err(|e| e.to_string()));
+    eprintln!(
+        "{}",
+        turn_line(&session, &name, started.elapsed(), finish, &extra)
+    );
     let usage = usage_of(&extra);
     Json(json!({"id": id, "object": "chat.completion", "created": created, "model": name,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}],
@@ -328,6 +338,39 @@ fn outcome(res: Result<Result<agent::Turn, String>, String>) -> (String, &'stati
         ),
         Ok(Err(e)) | Err(e) => (String::new(), "error", json!({"error": e})),
     }
+}
+
+/// One journal line per turn, for operators: ids, timing and counts, never prompt or reply text.
+fn turn_line(
+    session: &str,
+    bot: &str,
+    took: std::time::Duration,
+    finish: &str,
+    extra: &Value,
+) -> String {
+    let tools: Vec<&str> = extra["tools"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+        .unwrap_or_default();
+    let u = &extra["usage"];
+    let mut line = format!(
+        "turn session={session} bot={bot} ms={} result={finish} steps={} tools={} [{}] tokens={}/{} mode={}",
+        took.as_millis(),
+        extra["steps"].as_u64().unwrap_or(0),
+        tools.len(),
+        tools.join(","),
+        u["prompt_tokens"].as_u64().unwrap_or(0),
+        u["completion_tokens"].as_u64().unwrap_or(0),
+        extra["mode"].as_str().unwrap_or("-"),
+    );
+    if let Some(e) = extra["error"].as_str() {
+        // the class of failure, cut short: errors can quote model output
+        line.push_str(&format!(
+            " error={:?}",
+            e.chars().take(80).collect::<String>()
+        ));
+    }
+    line
 }
 
 fn usage_of(extra: &Value) -> Value {
@@ -437,6 +480,34 @@ async fn delete_job(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turn_line_has_counts_and_no_text() {
+        let extra = serde_json::json!({"steps": 3, "tools": ["web_search", "read_page"], "mode": "native",
+            "usage": {"prompt_tokens": 812, "completion_tokens": 140}});
+        let l = super::turn_line(
+            "s-1",
+            "nexy",
+            std::time::Duration::from_millis(87_000),
+            "stop",
+            &extra,
+        );
+        assert_eq!(
+            l,
+            "turn session=s-1 bot=nexy ms=87000 result=stop steps=3 tools=2 [web_search,read_page] tokens=812/140 mode=native"
+        );
+        let failed = super::turn_line(
+            "s-2",
+            "nexy",
+            std::time::Duration::from_millis(5),
+            "error",
+            &serde_json::json!({"error": "model said: ".to_string() + &"x".repeat(500)}),
+        );
+        assert!(
+            failed.contains("result=error") && failed.len() < 220,
+            "{failed}"
+        );
+    }
+
     #[test]
     fn keyless_engine_answers_only_its_loopback_name() {
         let h = |v: &str| {
