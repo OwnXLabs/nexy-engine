@@ -183,3 +183,92 @@ fn nothing_outlives_the_command() {
     );
     let _ = std::fs::remove_dir_all(&d.base);
 }
+
+fn via_run(d: &Dirs, cmd: &str) -> (String, Duration) {
+    let t0 = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_nexy-engine"))
+        .args(["sandbox-run"])
+        .arg(&d.ws)
+        .arg(&d.tmp)
+        .arg(cmd)
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    (text, t0.elapsed())
+}
+
+/// Live processes whose command line contains `marker`; killed so a failing run leaves nothing.
+fn survivors(marker: &str) -> String {
+    let out = Command::new("pgrep")
+        .args(["-fl", marker])
+        .output()
+        .unwrap();
+    let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !found.is_empty() {
+        let k = Command::new("pkill")
+            .args(["-9", "-f", marker])
+            .status()
+            .unwrap();
+        assert!(k.success(), "could not clean up {marker}");
+    }
+    found
+}
+
+/// A new session and a double fork leave the process group; they must still end with the call.
+#[test]
+fn a_new_session_does_not_outlive_the_command() {
+    let d = dirs("sid");
+    let marker = format!("sleep 30{}", std::process::id());
+    let escape = if Path::new("/usr/bin/setsid").exists() || Path::new("/bin/setsid").exists() {
+        format!("setsid {marker} &")
+    } else {
+        // macOS has no setsid command: perl does the same calls
+        format!(
+            "perl -e 'use POSIX; fork and exit; POSIX::setsid(); fork and exit; exec qw({marker})' &"
+        )
+    };
+    let (text, took) = via_run(&d, &format!("{escape} sleep 1; echo started"));
+    if unavailable(&text) {
+        return;
+    }
+    assert!(text.contains("started"), "{text}");
+    assert!(
+        took < Duration::from_secs(20),
+        "the call took {took:?}: {text}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let left = survivors(&marker);
+    assert!(left.is_empty(), "outlived the command: {left}\n{text}");
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// A bounded fork bomb (up to 2,047 processes) hits the per-command process limit and is cleaned up.
+#[test]
+fn a_fork_bomb_stops_at_the_process_limit() {
+    let d = dirs("bomb");
+    let marker = format!("sleep 4.{}", std::process::id());
+    let bomb = format!(
+        "b() {{ if [ $1 -lt 10 ]; then b $(($1+1)) & b $(($1+1)) & fi; {marker}; }}; b 0; wait"
+    );
+    let (text, took) = via_run(&d, &bomb);
+    if unavailable(&text) {
+        return;
+    }
+    assert!(took < Duration::from_secs(30), "took {took:?}");
+    assert!(
+        text.to_lowercase().contains("fork") || text.contains("Resource temporarily unavailable"),
+        "the bomb was not limited: {}",
+        &text[..text.len().min(400)]
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let left = survivors(&marker);
+    assert!(
+        left.is_empty(),
+        "outlived the command: {} processes",
+        left.lines().count()
+    );
+    let ok = Command::new("true").status().unwrap();
+    assert!(ok.success(), "the caller could no longer start processes");
+    let _ = std::fs::remove_dir_all(&d.base);
+}

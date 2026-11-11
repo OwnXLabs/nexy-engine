@@ -10,3 +10,7 @@ pub fn exec_confined(_: &str, _: &str, _: &str) -> i32 {
     eprintln!("refused: no command sandbox on this platform");
     126
 }
+
+pub fn inner(_: &str, _: &str, _: &str, _: &str) -> i32 {
+    126
+}
