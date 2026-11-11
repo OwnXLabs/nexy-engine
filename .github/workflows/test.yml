@@ -1,0 +1,23 @@
+# tests/run.sh on each push: unit tests, clippy, release build, binary size, idle memory.
+# The model checks need NEXY_ENGINE_MODEL_URL and are skipped here (no model server on the runner).
+name: test
+on:
+  push:
+permissions:
+  contents: read
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Tests
+        run: bash tests/run.sh
