@@ -80,6 +80,14 @@ loopback and needs `NEXY_ENGINE_KEY` to listen anywhere else.
 - `/api/sessions`, `/api/jobs`: history and scheduled tasks (routines). A schedule is `every 30m`,
   `daily 08:00` or standard 5-field cron such as `0 9 * * 1-5`, all in UTC. Bots with the
   `routine` tool can also create, list and delete routines in chat.
+- Routine approval: once outside content is in a chat's context (a web page, search result,
+  command output, file or saved memory, in this turn or earlier ones, or a system message the
+  caller has not vouched for), a routine the model creates is saved as `"status": "pending"`
+  with no next run, and the model cannot delete routines. Only the owner can then act, through
+  `POST /api/jobs/{id}/confirm` (schedules it) or `POST /api/jobs/{id}/discard` (deletes it);
+  neither is a tool. `GET /api/jobs` lists `status` and `origin`. A caller whose system message
+  holds only its own text sends `"context_clean": true` (chat completions) or
+  `metadata.context_clean` (responses).
 - `x-nexy-user`: the user a request acts for, set by the trusted caller. Sessions, memory, jobs and
   workspaces are kept per user.
 - `/health` answers `{"ok":true}`; details need the key.
