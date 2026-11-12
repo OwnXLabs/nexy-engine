@@ -151,7 +151,7 @@ pub const ALL: &[Tool] = &[
             Param {
                 name: "schedule",
                 kind: "string?",
-                desc: "UTC: \"daily 08:00\", \"every 2h\" or cron such as \"0 9 * * 1-5\" (create)",
+                desc: "in the user's local time (see Now): \"daily 08:00\", \"every 2h\" or cron such as \"0 9 * * 1-5\" (create)",
             },
             Param {
                 name: "prompt",
@@ -383,6 +383,8 @@ pub struct Ctx<'a> {
     pub outside: Vec<String>,
     /// lines the reply must carry to the owner
     pub notes: RefCell<Vec<String>>,
+    /// the owner's zone: routine clock times are read and shown in it
+    pub tz: jiff::tz::TimeZone,
 }
 
 impl Tool {
@@ -493,18 +495,20 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             Ok(jobs
                 .iter()
                 .map(|j| {
+                    // shown in the user's zone; the schedule's own zone when it differs
+                    let next = j
+                        .next_run_at
+                        .map_or("-".into(), |t| crate::scheduler::local_at(t, &cx.tz));
                     format!(
-                        "id {}: {} | {} | {} | {}",
+                        "id {}: {} | {} ({}) | {} | {}",
                         j.id,
                         j.name,
                         j.schedule,
+                        j.tz,
                         if j.status == PENDING {
                             "waiting for the user to confirm it".into()
                         } else {
-                            format!(
-                                "next {}",
-                                j.next_run_at.map_or("-".into(), crate::store::utc_at)
-                            )
+                            format!("next {next}")
                         },
                         j.prompt
                     )
@@ -525,29 +529,30 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             } else {
                 name
             };
-            let next = crate::scheduler::new_schedule(&schedule, crate::store::now())?;
+            let next = crate::scheduler::new_schedule(&schedule, &cx.tz, crate::store::now())?;
+            let tz = crate::scheduler::zone_name(&cx.tz);
             // outside content can ask for a routine; only the owner can make it run
             if !cx.outside.is_empty() {
                 let origin: String = cx.outside.join(", ").chars().take(300).collect();
                 let id = cx
                     .store
-                    .add_pending_job(cx.user, cx.bot, &name, &schedule, &prompt, &origin)
+                    .add_pending_job(cx.user, cx.bot, &name, &schedule, tz, &prompt, &origin)
                     .map_err(|e| e.to_string())?;
                 cx.notes.borrow_mut().push(format!(
                     "The routine \"{name}\" is waiting for you in Routines. It will not run until you confirm it there."
                 ));
                 return Ok(format!(
-                    "saved routine {id} \"{name}\" ({schedule}) but it is NOT scheduled: this conversation holds outside content, \
+                    "saved routine {id} \"{name}\" ({schedule}, {tz}) but it is NOT scheduled: this conversation holds outside content, \
                      so the user must confirm it in Routines first. Tell the user it is waiting for their confirmation in Routines."
                 ));
             }
             let id = cx
                 .store
-                .add_job(cx.user, cx.bot, &name, &schedule, &prompt, Some(next))
+                .add_job(cx.user, cx.bot, &name, &schedule, tz, &prompt, Some(next))
                 .map_err(|e| e.to_string())?;
             Ok(format!(
-                "created routine {id} \"{name}\" ({schedule}); first run {}",
-                crate::store::utc_at(next)
+                "created routine {id} \"{name}\" ({schedule}, {tz}); first run {}",
+                crate::scheduler::local_at(next, &cx.tz)
             ))
         }
         "delete" => {
@@ -1101,6 +1106,7 @@ mod tests {
             owner,
             outside: Vec::new(),
             notes: Default::default(),
+            tz: jiff::tz::TimeZone::UTC,
         };
         let t = find("routine").unwrap();
         let go = |args: Value, c: &Ctx| {
@@ -1143,6 +1149,28 @@ mod tests {
         );
         assert!(go(json!({"name": "x"}), &a).is_err());
         assert_eq!(t.schema()["required"], json!(["action"]));
+        // the owner in Manila: "daily 08:00" is 8 am there, and listed in their time
+        let mut m = cx("m", true);
+        m.tz = crate::scheduler::zone("Asia/Manila").unwrap();
+        let made = go(
+            json!({"action": "create", "name": "sales", "schedule": "daily 08:00", "prompt": "Check sales."}),
+            &m,
+        )
+        .unwrap();
+        assert!(made.contains("08:00 Asia/Manila"), "{made}");
+        let j = &store.jobs(Some("m")).unwrap()[0];
+        assert_eq!(j.tz, "Asia/Manila");
+        assert_eq!(
+            j.next_run_at.unwrap() % 86_400,
+            0,
+            "8 am Manila is 00:00 UTC"
+        );
+        let listed = go(json!({"action": "list"}), &m).unwrap();
+        assert!(
+            listed.contains("daily 08:00 (Asia/Manila) | next ")
+                && listed.contains(" 08:00 Asia/Manila"),
+            "{listed}"
+        );
     }
 
     fn clean<'a>(store: &'a Store) -> Ctx<'a> {
@@ -1156,6 +1184,7 @@ mod tests {
             owner: true,
             outside: Vec::new(),
             notes: Default::default(),
+            tz: jiff::tz::TimeZone::UTC,
         }
     }
 
@@ -1256,7 +1285,7 @@ mod tests {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let cx = clean(&store);
         let id = store
-            .add_pending_job("a", "nexy", "j", "every 1h", "p", "x")
+            .add_pending_job("a", "nexy", "j", "every 1h", "UTC", "p", "x")
             .unwrap();
         let t = find("routine").unwrap();
         for action in ["confirm", "approve", "activate", "enable", "discard"] {

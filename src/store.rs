@@ -42,6 +42,8 @@ pub struct Job {
     pub status: String,
     /// outside content that was in context when it was made, if any
     pub origin: Option<String>,
+    /// the owner's zone (IANA name) its clock times are read in; "UTC" for jobs made before zones
+    pub tz: String,
 }
 
 pub const PENDING: &str = "pending";
@@ -80,10 +82,6 @@ pub fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-pub fn utc_now() -> String {
-    utc_at(now())
 }
 
 pub fn utc_at(s: i64) -> String {
@@ -127,6 +125,7 @@ impl Store {
             ("jobs", "user", USER_COL),
             ("jobs", "status", "TEXT NOT NULL DEFAULT 'active'"),
             ("jobs", "origin", "TEXT"),
+            ("jobs", "tz", "TEXT NOT NULL DEFAULT 'UTC'"),
         ] {
             let has: bool = db
                 .prepare(&format!(
@@ -269,29 +268,33 @@ impl Store {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_job(
         &self,
         user: &str,
         bot: &str,
         name: &str,
         schedule: &str,
+        tz: &str,
         prompt: &str,
         next: Option<i64>,
     ) -> Result<i64, JobError> {
-        self.insert_job(user, bot, name, schedule, prompt, next, None)
+        self.insert_job(user, bot, name, schedule, tz, prompt, next, None)
     }
 
     /// Saved but not scheduled: no next run until the owner confirms it.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_pending_job(
         &self,
         user: &str,
         bot: &str,
         name: &str,
         schedule: &str,
+        tz: &str,
         prompt: &str,
         origin: &str,
     ) -> Result<i64, JobError> {
-        self.insert_job(user, bot, name, schedule, prompt, None, Some(origin))
+        self.insert_job(user, bot, name, schedule, tz, prompt, None, Some(origin))
     }
 
     /// Counts and inserts under one lock, so parallel requests cannot pass the caps together.
@@ -302,6 +305,7 @@ impl Store {
         bot: &str,
         name: &str,
         schedule: &str,
+        tz: &str,
         prompt: &str,
         next: Option<i64>,
         origin: Option<&str>,
@@ -320,9 +324,9 @@ impl Store {
         }
         let status = if origin.is_some() { PENDING } else { "active" };
         db.execute(
-            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![user, bot, name, schedule, prompt, next, status, origin],
+            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin, tz)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![user, bot, name, schedule, prompt, next, status, origin, tz],
         )?;
         Ok(db.last_insert_rowid())
     }
@@ -331,11 +335,11 @@ impl Store {
         Ok(self.jobs(Some(user))?.into_iter().find(|j| j.id == id))
     }
 
-    /// Owner only, through the API: a pending job becomes active with its first run.
-    pub fn confirm_job(&self, user: &str, id: i64, next: i64) -> rusqlite::Result<usize> {
+    /// Owner only, through the API: a pending job becomes active with its first run, in the owner's zone.
+    pub fn confirm_job(&self, user: &str, id: i64, next: i64, tz: &str) -> rusqlite::Result<usize> {
         self.db.lock().unwrap().execute(
-            "UPDATE jobs SET status = 'active', next_run_at = ?3 WHERE id = ?1 AND user = ?2 AND status = ?4",
-            params![id, user, next, PENDING],
+            "UPDATE jobs SET status = 'active', next_run_at = ?3, tz = ?5 WHERE id = ?1 AND user = ?2 AND status = ?4",
+            params![id, user, next, PENDING, tz],
         )
     }
 
@@ -359,7 +363,7 @@ impl Store {
     pub fn jobs(&self, user: Option<&str>) -> rusqlite::Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(
-            "SELECT id, user, bot, name, schedule, prompt, enabled, next_run_at, last_run_at, last_status, status, origin FROM jobs
+            "SELECT id, user, bot, name, schedule, prompt, enabled, next_run_at, last_run_at, last_status, status, origin, tz FROM jobs
              WHERE ?1 IS NULL OR user = ?1 ORDER BY id",
         )?;
         let rows = st.query_map(params![user], |r| {
@@ -376,6 +380,7 @@ impl Store {
                 last_status: r.get(9)?,
                 status: r.get(10)?,
                 origin: r.get(11)?,
+                tz: r.get(12)?,
             })
         })?;
         rows.collect()
@@ -413,7 +418,8 @@ mod tests {
         s.ensure_session("a", "s1", "nexy", "t", "api").unwrap();
         s.append("s1", "user", "hello", None).unwrap();
         s.remember("a", "nexy", "secret plan").unwrap();
-        s.add_job("a", "nexy", "j", "every 1h", "p", None).unwrap();
+        s.add_job("a", "nexy", "j", "every 1h", "UTC", "p", None)
+            .unwrap();
         assert_eq!(s.session_user("s1").unwrap().as_deref(), Some("a"));
         assert!(s.sessions("b", 50).unwrap().is_empty());
         assert!(s.recall("b", "nexy", "secret", 5).unwrap().is_empty());
@@ -430,25 +436,29 @@ mod tests {
     fn pending_jobs_wait_for_confirm_or_discard() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         let id = s
-            .add_pending_job("a", "nexy", "j", "every 1h", "p", "read_page")
+            .add_pending_job("a", "nexy", "j", "every 1h", "UTC", "p", "read_page")
             .unwrap();
         let j = s.job("a", id).unwrap().unwrap();
         assert_eq!((j.status.as_str(), j.next_run_at), (PENDING, None));
         assert_eq!(j.origin.as_deref(), Some("read_page"));
         s.finish_job(id, "ok", Some(5)).unwrap();
         assert_eq!(s.job("a", id).unwrap().unwrap().next_run_at, None);
-        assert_eq!(s.confirm_job("b", id, 99).unwrap(), 0);
-        assert_eq!(s.confirm_job("a", id, 99).unwrap(), 1);
+        assert_eq!(s.confirm_job("b", id, 99, "UTC").unwrap(), 0);
+        assert_eq!(s.confirm_job("a", id, 99, "UTC").unwrap(), 1);
         let j = s.job("a", id).unwrap().unwrap();
         assert_eq!((j.status.as_str(), j.next_run_at), ("active", Some(99)));
-        assert_eq!(s.confirm_job("a", id, 5).unwrap(), 0, "confirms once");
+        assert_eq!(
+            s.confirm_job("a", id, 5, "UTC").unwrap(),
+            0,
+            "confirms once"
+        );
         assert_eq!(
             s.discard_job("a", id).unwrap(),
             0,
             "discard is for pending only"
         );
         let p = s
-            .add_pending_job("a", "nexy", "k", "every 1h", "p", "x")
+            .add_pending_job("a", "nexy", "k", "every 1h", "UTC", "p", "x")
             .unwrap();
         assert_eq!(s.discard_job("b", p).unwrap(), 0);
         assert_eq!(s.discard_job("a", p).unwrap(), 1);
@@ -459,40 +469,56 @@ mod tests {
     fn routines_are_capped_per_user_and_per_bot() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         for i in 0..MAX_JOBS_PER_USER - 1 {
-            s.add_job("a", "nexy", &format!("j{i}"), "every 1h", "p", Some(1))
-                .unwrap();
-        }
-        s.add_pending_job("a", "nexy", "last", "every 1h", "p", "read_page")
+            s.add_job(
+                "a",
+                "nexy",
+                &format!("j{i}"),
+                "every 1h",
+                "UTC",
+                "p",
+                Some(1),
+            )
             .unwrap();
-        let full = s.add_job("a", "nexy", "x", "every 1h", "p", Some(1));
+        }
+        s.add_pending_job("a", "nexy", "last", "every 1h", "UTC", "p", "read_page")
+            .unwrap();
+        let full = s.add_job("a", "nexy", "x", "every 1h", "UTC", "p", Some(1));
         assert!(matches!(full, Err(JobError::Full(_))), "{full:?}");
-        let full = s.add_pending_job("a", "other", "x", "every 1h", "p", "o");
+        let full = s.add_pending_job("a", "other", "x", "every 1h", "UTC", "p", "o");
         assert!(matches!(full, Err(JobError::Full(_))), "pending count too");
-        s.add_job("b", "nexy", "x", "every 1h", "p", Some(1))
+        s.add_job("b", "nexy", "x", "every 1h", "UTC", "p", Some(1))
             .unwrap();
         for u in 0..MAX_JOBS_PER_BOT - MAX_JOBS_PER_USER - 1 {
-            s.add_job(&format!("u{u}"), "nexy", "x", "every 1h", "p", Some(1))
-                .unwrap();
+            s.add_job(
+                &format!("u{u}"),
+                "nexy",
+                "x",
+                "every 1h",
+                "UTC",
+                "p",
+                Some(1),
+            )
+            .unwrap();
         }
-        let full = s.add_job("fresh", "nexy", "x", "every 1h", "p", Some(1));
+        let full = s.add_job("fresh", "nexy", "x", "every 1h", "UTC", "p", Some(1));
         assert!(
             full.as_ref()
                 .is_err_and(|e| e.to_string().contains("this bot")),
             "{full:?}"
         );
         assert!(
-            s.add_job("fresh", "coder", "x", "every 1h", "p", Some(1))
+            s.add_job("fresh", "coder", "x", "every 1h", "UTC", "p", Some(1))
                 .is_ok()
         );
         assert_eq!(s.delete_job("a", 1).unwrap(), 1);
         assert!(
-            s.add_job("a", "coder", "x", "every 1h", "p", Some(1))
+            s.add_job("a", "coder", "x", "every 1h", "UTC", "p", Some(1))
                 .is_ok()
         );
     }
 
     #[test]
-    fn old_database_gains_status_and_keeps_its_jobs() {
+    fn old_database_gains_status_and_zone_and_keeps_its_jobs() {
         let path = std::env::temp_dir().join(format!("nexy-old-{}.db", std::process::id()));
         if path.exists() {
             std::fs::remove_file(&path).unwrap();
@@ -512,6 +538,7 @@ mod tests {
             (j.status.as_str(), j.next_run_at, j.origin),
             ("active", Some(42), None)
         );
+        assert_eq!(j.tz, "UTC", "a job from before zones keeps running in UTC");
         drop(s);
         Store::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();

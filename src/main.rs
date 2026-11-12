@@ -230,6 +230,7 @@ fn ask(app: &App, args: &[String]) -> i32 {
             outside: false,
             owner: true,
             research: None,
+            tz: jiff::tz::TimeZone::UTC,
             workspace: workspace.as_deref(),
             cancel: None,
             progress: None,
