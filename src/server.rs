@@ -1012,6 +1012,53 @@ pub(crate) mod tests {
         }
     }
 
+    /// QA 0.2.8: a model server killed mid-answer whose stream still ended cleanly. Without the
+    /// model's own end marker the turn is a broken one (the owner is offered Continue), never an
+    /// answer that looks whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_without_its_end_is_a_broken_turn() {
+        use axum::routing::post;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = format!("http://{}", l.local_addr().unwrap());
+        let half = serde_json::json!({"choices": [{"index": 0, "delta": {"content": "Half an ans"}, "finish_reason": null}]});
+        let r = axum::Router::new()
+            .route("/v1/chat/completions", post(move || async move { format!("data: {half}\n\n") }))
+            .route("/api/chat", post(|| async { format!("{}\n", serde_json::json!({"message": {"role": "assistant", "content": "Half an ans"}, "done": false})) }));
+        tokio::spawn(axum::serve(l, r).into_future());
+        for ollama in [false, true] {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let mut app = with_bot(test_app(port));
+            app.backend = crate::model::Backend::new(&model, "m", None);
+            *app.backend.caps.write().unwrap() = crate::model::Caps {
+                ollama,
+                probed_at: 1,
+                ..Default::default()
+            };
+            let srv =
+                tokio::spawn(axum::serve(l, super::router(std::sync::Arc::new(app))).into_future());
+            let res = tokio::task::spawn_blocking(move || {
+                let body = ureq::post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                    .send_json(serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "stream": true}))
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .into_string()
+                    .unwrap();
+                assert!(body.contains("Half an ans"), "what arrived is passed on: {body}");
+                let last = body
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .filter(|d| *d != "[DONE]")
+                    .last()
+                    .map(|d| serde_json::from_str::<serde_json::Value>(d).unwrap())
+                    .unwrap();
+                assert_eq!(last["choices"][0]["finish_reason"], "error", "ollama={ollama}: {last}");
+            })
+            .await;
+            srv.abort();
+            res.unwrap();
+        }
+    }
+
     pub(crate) fn test_app(port: u16) -> crate::App {
         crate::App {
             cfg: crate::config::Config {

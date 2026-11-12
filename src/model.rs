@@ -112,11 +112,21 @@ pub trait Sink {
     fn text(&self, t: &str);
 }
 
-fn lines(resp: ureq::Response, mut each: impl FnMut(Value)) -> Result<(), String> {
+/// Reads a streamed reply; `finished` says whether a chunk marks the end of the answer. A stream
+/// that ends without one was cut off (the model server killed mid-answer), not finished.
+fn lines(
+    resp: ureq::Response,
+    finished: impl Fn(&Value) -> bool,
+    mut each: impl FnMut(Value),
+) -> Result<(), String> {
     use std::io::BufRead;
+    let mut done = false;
     for line in std::io::BufReader::new(resp.into_reader()).lines() {
         let line = line.map_err(|e| format!("model stream broke: {e}"))?;
         let data = line.strip_prefix("data:").unwrap_or(&line).trim();
+        if data == "[DONE]" {
+            done = true;
+        }
         if data.is_empty() || data == "[DONE]" || line.starts_with(':') {
             continue;
         }
@@ -125,7 +135,11 @@ fn lines(resp: ureq::Response, mut each: impl FnMut(Value)) -> Result<(), String
         if let Some(e) = v.get("error") {
             return Err(format!("model server error: {e}"));
         }
+        done |= finished(&v);
         each(v);
+    }
+    if !done {
+        return Err("model stream broke: it ended before the answer finished".into());
     }
     Ok(())
 }
@@ -261,7 +275,8 @@ impl Backend {
             body["stream_options"] = json!({"include_usage": true});
             let mut r = Reply::default();
             let mut calls: Vec<(String, String)> = Vec::new();
-            lines(self.post("/v1/chat/completions", body)?, |v| {
+            let end = |v: &Value| !v["choices"][0]["finish_reason"].is_null();
+            lines(self.post("/v1/chat/completions", body)?, end, |v| {
                 if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
                     r.prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
                     r.completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
@@ -339,19 +354,23 @@ impl Backend {
             let mut body = self.ollama_body(req, caps);
             body["stream"] = json!(true);
             let mut r = Reply::default();
-            lines(self.post("/api/chat", body)?, |v| {
-                let msg = &v["message"];
-                if let Some(t) = msg["content"].as_str().filter(|t| !t.is_empty()) {
-                    r.content.push_str(t);
-                    on_text.text(t);
-                }
-                r.calls.extend(calls_of(msg));
-                if v["done"] == true {
-                    r.prompt_tokens = v["prompt_eval_count"].as_u64().unwrap_or(0);
-                    r.completion_tokens = v["eval_count"].as_u64().unwrap_or(0);
-                    r.cut = v["done_reason"] == "length";
-                }
-            })?;
+            lines(
+                self.post("/api/chat", body)?,
+                |v| v["done"] == true,
+                |v| {
+                    let msg = &v["message"];
+                    if let Some(t) = msg["content"].as_str().filter(|t| !t.is_empty()) {
+                        r.content.push_str(t);
+                        on_text.text(t);
+                    }
+                    r.calls.extend(calls_of(msg));
+                    if v["done"] == true {
+                        r.prompt_tokens = v["prompt_eval_count"].as_u64().unwrap_or(0);
+                        r.completion_tokens = v["eval_count"].as_u64().unwrap_or(0);
+                        r.cut = v["done_reason"] == "length";
+                    }
+                },
+            )?;
             return Ok(r);
         }
         let v: Value = self
