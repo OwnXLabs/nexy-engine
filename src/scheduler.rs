@@ -405,8 +405,66 @@ pub async fn run(app: Arc<App>) {
     }
 }
 
-/// Runs a routine now, off the async threads. `event` is the fenced content of the event that
-/// started it: outside content, so writes are refused and nothing new is scheduled from it.
+/// One run of a routine: the session it ran in and its reply, or why it did not finish.
+pub struct Ran {
+    pub session: String,
+    pub reply: Result<String, String>,
+}
+
+impl Ran {
+    /// What the routine list shows: "ok" or "error: …".
+    pub fn status(&self) -> String {
+        match &self.reply {
+            Ok(_) => "ok".into(),
+            Err(e) => format!("error: {e}"),
+        }
+    }
+}
+
+/// Runs a routine once, here and now, as every run does: its own prompt in a session of its own,
+/// never as the owner. `event` is the fenced content of the event that started it: outside
+/// content, so writes are refused and nothing new is scheduled from it.
+pub fn execute(app: &App, job: &Job, tz: TimeZone, event: Option<&str>, title: &str) -> Ran {
+    let kind = if event.is_some() { "event" } else { "cron" };
+    let session = format!("{kind}-{}-{}", job.id, now());
+    let Some(bot) = app.bots.get(&job.bot) else {
+        return Ran {
+            session,
+            reply: Err(format!("no bot \"{}\"", job.bot)),
+        };
+    };
+    if let Err(e) = app.store.ensure_session(
+        &job.user,
+        &session,
+        &bot.name,
+        &format!("{}: {title}", job.name),
+        kind,
+    ) {
+        eprintln!("scheduler: job {}: session: {e}", job.id);
+    }
+    let reply = crate::agent::run(
+        app,
+        bot,
+        crate::agent::Input {
+            user: &job.user,
+            session: &session,
+            text: &job.prompt,
+            context: event,
+            outside: event.is_some(),
+            owner: false,
+            research: None,
+            tz,
+            workspace: None,
+            cancel: None,
+            progress: None,
+            on_text: None,
+        },
+    )
+    .map(|t| t.reply);
+    Ran { session, reply }
+}
+
+/// Runs a routine off the async threads and records how it went; see `execute`.
 pub fn start(
     app: Arc<App>,
     job: Job,
@@ -415,45 +473,13 @@ pub fn start(
     event: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let status = match app.bots.get(&job.bot) {
-            None => format!("error: no bot \"{}\"", job.bot),
-            Some(bot) => {
-                let (kind, title) = match event {
-                    Some(_) => ("event", "on an event"),
-                    None => ("cron", "scheduled"),
-                };
-                let session = format!("{kind}-{}-{}", job.id, now());
-                let _ = app.store.ensure_session(
-                    &job.user,
-                    &session,
-                    &bot.name,
-                    &format!("{}: {title}", job.name),
-                    kind,
-                );
-                match crate::agent::run(
-                    &app,
-                    bot,
-                    crate::agent::Input {
-                        user: &job.user,
-                        session: &session,
-                        text: &job.prompt,
-                        context: event.as_deref(),
-                        outside: event.is_some(),
-                        owner: false,
-                        research: None,
-                        tz,
-                        workspace: None,
-                        cancel: None,
-                        progress: None,
-                        on_text: None,
-                    },
-                ) {
-                    Ok(_) => "ok".into(),
-                    Err(e) => format!("error: {e}"),
-                }
-            }
+        let title = if event.is_some() {
+            "on an event"
+        } else {
+            "scheduled"
         };
-        if let Err(e) = app.store.finish_job(job.id, &status, next) {
+        let ran = execute(&app, &job, tz, event.as_deref(), title);
+        if let Err(e) = app.store.finish_job(job.id, &ran.status(), next) {
             eprintln!("scheduler: job {}: {e}", job.id);
         }
     })

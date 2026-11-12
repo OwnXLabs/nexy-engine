@@ -30,6 +30,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/jobs/{id}/discard", post(discard_job))
         .route("/api/jobs/{id}/pause", post(pause_job))
         .route("/api/jobs/{id}/resume", post(resume_job))
+        .route("/api/jobs/{id}/run", post(run_job))
         .route("/api/events", post(event))
         .route("/api/probe", post(probe));
     Router::new()
@@ -644,6 +645,79 @@ fn set_enabled(app: &App, user: &str, id: i64, on: bool) -> Response {
     }
 }
 
+/// The owner runs a routine once, now, and gets its result: the scheduler's own run (its prompt,
+/// never as the owner, the same taint rules), not a chat turn about it. Its schedule is unchanged.
+/// A routine started by events needs its event, so it is not run here.
+async fn run_job(
+    State(app): S,
+    User(user): User,
+    Path(p): Path<HashMap<String, String>>,
+) -> Response {
+    let id = job_id(&p);
+    let job = match app.store.job(&user, id) {
+        Ok(Some(j)) => j,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "no routine with that id"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let refused = if job.status == PENDING {
+        Some("this routine is waiting for confirmation: confirm or discard it")
+    } else if job.trigger.is_some() {
+        Some("this routine runs when its event arrives")
+    } else if !job.enabled {
+        Some("this routine is paused: resume it first")
+    } else {
+        None
+    };
+    if let Some(why) = refused {
+        return err(StatusCode::CONFLICT, why);
+    }
+    let tz = match zone(&job.tz) {
+        Ok(z) => z,
+        Err(e) => return err(StatusCode::CONFLICT, &e),
+    };
+    match app.store.start_job(id, job.next_run_at) {
+        Ok(0) => return err(StatusCode::CONFLICT, "this routine is paused or gone"),
+        Ok(_) => {}
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+    let a = app.clone();
+    let ran = match tokio::task::spawn_blocking(move || {
+        let ran = crate::scheduler::execute(&a, &job, tz, None, "run now");
+        // the next run as it stands now: the clock may have moved it meanwhile
+        let next = match a.store.job(&job.user, job.id) {
+            Ok(j) => j.and_then(|j| j.next_run_at),
+            Err(e) => {
+                eprintln!("run now: job {}: {e}", job.id);
+                job.next_run_at
+            }
+        };
+        if let Err(e) = a.store.finish_job(job.id, &ran.status(), next) {
+            eprintln!("run now: job {}: {e}", job.id);
+        }
+        ran
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("the run stopped: {e}"),
+            );
+        }
+    };
+    match ran.reply {
+        Ok(reply) => {
+            Json(json!({"run": {"id": id, "session": ran.session, "status": "ok", "reply": reply}}))
+                .into_response()
+        }
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            &format!("the routine did not finish: {e}"),
+        ),
+    }
+}
+
 /// An event from a source the caller trusts to report it (the connector hub). It starts only the
 /// user's active routines whose trigger matches, each as a tainted run.
 async fn event(State(app): S, User(user): User, Json(e): Json<crate::triggers::Event>) -> Response {
@@ -904,6 +978,120 @@ pub(crate) mod tests {
         let jobs = app.store.jobs(Some("owner")).unwrap();
         let tz: Vec<&str> = jobs.iter().map(|j| j.tz.as_str()).collect();
         assert_eq!(tz, ["Asia/Manila", "Asia/Manila", "UTC"]);
+    }
+
+    /// A stand-in model that answers with the last line it was given, so a run's reply shows the
+    /// prompt that reached it.
+    async fn echo_model() -> String {
+        async fn chat(axum::Json(b): axum::Json<serde_json::Value>) -> String {
+            let last = b["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or("")
+                .lines()
+                .last()
+                .unwrap_or("")
+                .to_string();
+            serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": format!("**Reminder:** {last}")}}]})
+            .to_string()
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let r = axum::Router::new().route("/v1/chat/completions", axum::routing::post(chat));
+        tokio::spawn(axum::serve(l, r).into_future());
+        url
+    }
+
+    /// QA 0.2.9: the first run of a new routine was a chat turn about it, and the model said it
+    /// cannot run routines. The owner's run-now is the scheduler's run, and its reply comes back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_runs_a_routine_now_and_gets_its_result() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut app = with_bot(test_app(port));
+        let model = echo_model().await;
+        app.backend = crate::model::Backend::new(&model, "m", None);
+        *app.backend.caps.write().unwrap() = crate::model::Caps {
+            mode: crate::model::Mode::Native,
+            native_tools: true,
+            probed_at: 1,
+            ..Default::default()
+        };
+        app.bots.get_mut("nexy").unwrap().max_tokens = 64;
+        app.bots.get_mut("nexy").unwrap().max_secs = 30;
+        let app = std::sync::Arc::new(app);
+        let s = &app.store;
+        let next = crate::store::now() + 86_400;
+        let fridge = s
+            .add_job(
+                "owner",
+                "nexy",
+                "fridge",
+                "30 7 * * 1-5",
+                "Asia/Manila",
+                "Remind me to check the fridge temperature.",
+                Some(next),
+            )
+            .unwrap();
+        let wait = s
+            .add_pending_job("owner", "nexy", "w", "every 1h", "UTC", "p", "x")
+            .unwrap();
+        let mail = s
+            .add_trigger_job(
+                "owner",
+                "nexy",
+                "m",
+                "mail from=a@example.com",
+                "UTC",
+                "p",
+                None,
+            )
+            .unwrap();
+        let paused = s
+            .add_job("owner", "nexy", "p", "every 1h", "UTC", "p", Some(next))
+            .unwrap();
+        s.set_enabled("owner", paused, false, None).unwrap();
+        let srv = tokio::spawn(axum::serve(l, super::router(app.clone())).into_future());
+        let res = tokio::task::spawn_blocking(move || {
+            let run = |id: i64, user: &str| -> (u16, serde_json::Value) {
+                let r = ureq::post(&format!("http://127.0.0.1:{port}/api/jobs/{id}/run"))
+                    .set("x-nexy-user", user)
+                    .call();
+                let r = match r {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(_, r)) => r,
+                    Err(e) => panic!("{e}"),
+                };
+                (r.status(), r.into_json().unwrap())
+            };
+            assert_eq!(run(fridge, "other").0, 404, "only its owner runs it");
+            for (id, why) in [(wait, "confirm"), (mail, "event"), (paused, "paused")] {
+                let (code, b) = run(id, "owner");
+                assert_eq!(code, 409, "{b}");
+                assert!(b["error"].as_str().unwrap().contains(why), "{b}");
+            }
+            let (code, b) = run(fridge, "owner");
+            assert_eq!(code, 200, "{b}");
+            assert_eq!(
+                b["run"]["reply"], "**Reminder:** Remind me to check the fridge temperature.",
+                "the routine's own prompt ran: {b}"
+            );
+            assert!(
+                b["run"]["session"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("cron-{fridge}-"))
+            );
+        })
+        .await;
+        srv.abort();
+        res.unwrap();
+        let j = s.job("owner", fridge).unwrap().unwrap();
+        assert_eq!(j.last_status.as_deref(), Some("ok"));
+        assert_eq!(j.next_run_at, Some(next), "its schedule is unchanged");
+        assert_eq!(s.job("owner", paused).unwrap().unwrap().last_status, None);
     }
 
     /// A stand-in model server: OpenAI style at /v1/chat/completions, Ollama style at /api/chat.
