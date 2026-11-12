@@ -109,6 +109,19 @@ whose `Host` is `127.0.0.1`, `localhost` or `[::1]` on its own port, or a name l
   chat's context, `write_file`, `edit_file`, `remember` and `run` are refused for the rest of that
   chat, and the reply tells the owner, who can ask again in a new chat. Reading the workspace or
   saved facts does not block writes, since only the owner or a clean turn put things there.
+- Event triggers: a routine can run when an event arrives instead of on a schedule. Send
+  `"trigger": "mail from=alice@example.com"` (or `'file folder="Invoices 2026"'`) in place of
+  `schedule` with `POST /api/jobs`: a source name, then fields that must all be equal, ignoring
+  case. The caller that watches the source (the connector hub) posts each event to
+  `POST /api/events` as `{"source": "mail", "id": "<the source's own id>", "fields": {"from":
+  "alice@example.com"}, "text": "…"}`, with fields normalised (a bare address, a folder's name)
+  and text capped at 8,000 bytes. The answer lists the routines `started`, those this event
+  already ran (`duplicate`, so a repeat runs nothing), and those over a limit (`limited`, each with
+  `retry_after` seconds; the event is not recorded, so send it again then). Limits: one event run
+  per routine every 5 minutes and 20 per user an hour. Only active routines match: a trigger
+  routine the model creates is always saved as `pending`, even in a clean chat, until the owner
+  confirms it. Every event run holds the event as outside content, so its writes are refused and
+  it cannot create or delete routines. Event ids are kept 30 days.
 - `x-nexy-user`: the user a request acts for, set by the trusted caller. Sessions, memory, jobs and
   workspaces are kept per user.
 - `/health` answers `{"ok":true}`; details need the key.

@@ -244,10 +244,11 @@ impl Cron {
     }
 }
 
-/// Jobs to run now. A pending job never runs, even with a next run set.
+/// Jobs to run now. A pending job never runs, even with a next run set; nor does one an event starts.
 pub fn due(jobs: Vec<Job>, at: i64) -> Vec<Job> {
     jobs.into_iter()
-        .filter(|j| j.enabled && j.status != PENDING && j.next_run_at.is_some_and(|t| t <= at))
+        .filter(|j| j.enabled && j.status != PENDING && j.trigger.is_none())
+        .filter(|j| j.next_run_at.is_some_and(|t| t <= at))
         .collect()
 }
 
@@ -278,48 +279,63 @@ pub async fn run(app: Arc<App>) {
                 eprintln!("scheduler: job {}: {e}", job.id);
                 continue;
             }
-            let app = app.clone();
-            tokio::task::spawn_blocking(move || {
-                let status = match app.bots.get(&job.bot) {
-                    None => format!("error: no bot \"{}\"", job.bot),
-                    Some(bot) => {
-                        let session = format!("cron-{}-{}", job.id, now());
-                        let _ = app.store.ensure_session(
-                            &job.user,
-                            &session,
-                            &bot.name,
-                            &format!("{}: scheduled", job.name),
-                            "cron",
-                        );
-                        match crate::agent::run(
-                            &app,
-                            bot,
-                            crate::agent::Input {
-                                user: &job.user,
-                                session: &session,
-                                text: &job.prompt,
-                                context: None,
-                                outside: false,
-                                owner: false,
-                                research: None,
-                                tz: tz.clone(),
-                                workspace: None,
-                                cancel: None,
-                                progress: None,
-                                on_text: None,
-                            },
-                        ) {
-                            Ok(_) => "ok".into(),
-                            Err(e) => format!("error: {e}"),
-                        }
-                    }
-                };
-                if let Err(e) = app.store.finish_job(job.id, &status, next) {
-                    eprintln!("scheduler: job {}: {e}", job.id);
-                }
-            });
+            start(app.clone(), job, tz, next, None);
         }
     }
+}
+
+/// Runs a routine now, off the async threads. `event` is the fenced content of the event that
+/// started it: outside content, so writes are refused and nothing new is scheduled from it.
+pub fn start(
+    app: Arc<App>,
+    job: Job,
+    tz: TimeZone,
+    next: Option<i64>,
+    event: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let status = match app.bots.get(&job.bot) {
+            None => format!("error: no bot \"{}\"", job.bot),
+            Some(bot) => {
+                let (kind, title) = match event {
+                    Some(_) => ("event", "on an event"),
+                    None => ("cron", "scheduled"),
+                };
+                let session = format!("{kind}-{}-{}", job.id, now());
+                let _ = app.store.ensure_session(
+                    &job.user,
+                    &session,
+                    &bot.name,
+                    &format!("{}: {title}", job.name),
+                    kind,
+                );
+                match crate::agent::run(
+                    &app,
+                    bot,
+                    crate::agent::Input {
+                        user: &job.user,
+                        session: &session,
+                        text: &job.prompt,
+                        context: event.as_deref(),
+                        outside: event.is_some(),
+                        owner: false,
+                        research: None,
+                        tz,
+                        workspace: None,
+                        cancel: None,
+                        progress: None,
+                        on_text: None,
+                    },
+                ) {
+                    Ok(_) => "ok".into(),
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+        };
+        if let Err(e) = app.store.finish_job(job.id, &status, next) {
+            eprintln!("scheduler: job {}: {e}", job.id);
+        }
+    })
 }
 
 #[cfg(test)]
@@ -343,7 +359,7 @@ mod tests {
         assert_eq!(jobs[1].status, PENDING);
         let ids: Vec<i64> = due(jobs, 100).iter().map(|j| j.id).collect();
         assert_eq!(ids, vec![live], "pending job {wait} was due");
-        s.confirm_job("a", wait, 50, "UTC").unwrap();
+        s.confirm_job("a", wait, Some(50), "UTC").unwrap();
         assert_eq!(due(s.jobs(None).unwrap(), 100).len(), 2);
     }
 

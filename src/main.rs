@@ -15,6 +15,7 @@ mod scheduler;
 mod server;
 mod store;
 mod tools;
+mod triggers;
 mod uhp;
 
 use mimalloc::MiMalloc;

@@ -28,6 +28,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/jobs/{id}", delete(delete_job))
         .route("/api/jobs/{id}/confirm", post(confirm_job))
         .route("/api/jobs/{id}/discard", post(discard_job))
+        .route("/api/events", post(event))
         .route("/api/probe", post(probe));
     Router::new()
         .merge(api.clone())
@@ -468,7 +469,11 @@ async fn jobs(State(app): S, User(user): User) -> Response {
 #[derive(Deserialize)]
 struct NewJob {
     name: String,
-    schedule: String,
+    /// a schedule, or a trigger such as "mail from=a@example.com": one of the two
+    #[serde(default)]
+    schedule: Option<String>,
+    #[serde(default)]
+    trigger: Option<String>,
     prompt: String,
     /// the owner's zone; clock times in the schedule are read in it. UTC when absent.
     #[serde(default)]
@@ -489,19 +494,29 @@ async fn create_job(
         Ok(z) => z,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
-    let next = match new_schedule(&j.schedule, &tz, now()) {
-        Ok(n) => n,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
-    };
     let name = zone_name(&tz);
-    match app
-        .store
-        .add_job(&user, &bot, &j.name, &j.schedule, name, &j.prompt, Some(next))
-    {
-        Ok(id) => Json(
-            json!({"job": {"id": id, "name": j.name, "schedule": j.schedule, "tz": name, "next_run_at": next}}),
-        )
-        .into_response(),
+    let made = match (j.schedule.as_deref(), j.trigger.as_deref()) {
+        (Some(schedule), None) => match new_schedule(schedule, &tz, now()) {
+            Ok(next) => app
+                .store
+                .add_job(&user, &bot, &j.name, schedule, name, &j.prompt, Some(next))
+                .map(|id| json!({"id": id, "name": j.name, "schedule": schedule, "tz": name, "next_run_at": next})),
+            Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+        },
+        // the owner made it here, so it is active; each run it starts is still tainted
+        (None, Some(t)) => match crate::triggers::parse(t) {
+            Ok(t) => {
+                let t = t.to_string();
+                app.store
+                    .add_trigger_job(&user, &bot, &j.name, &t, name, &j.prompt, None)
+                    .map(|id| json!({"id": id, "name": j.name, "trigger": t, "tz": name}))
+            }
+            Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+        },
+        _ => return err(StatusCode::BAD_REQUEST, "send a \"schedule\" or a \"trigger\""),
+    };
+    match made {
+        Ok(job) => Json(json!({ "job": job })).into_response(),
         Err(JobError::Full(m)) => err(StatusCode::CONFLICT, &m),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -555,9 +570,13 @@ async fn confirm_job(
         Ok(z) => z,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
-    let next = match new_schedule(&job.schedule, &tz, now()) {
-        Ok(n) => n,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+    // a trigger routine has no clock: events start it once it is active
+    let next = match job.trigger {
+        Some(_) => None,
+        None => match new_schedule(&job.schedule, &tz, now()) {
+            Ok(n) => Some(n),
+            Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+        },
     };
     let name = zone_name(&tz);
     match app.store.confirm_job(&user, id, next, name) {
@@ -567,6 +586,15 @@ async fn confirm_job(
                 .into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// An event from a source the caller trusts to report it (the connector hub). It starts only the
+/// user's active routines whose trigger matches, each as a tainted run.
+async fn event(State(app): S, User(user): User, Json(e): Json<crate::triggers::Event>) -> Response {
+    match crate::triggers::deliver(&app, &user, e, now()) {
+        Ok(o) => Json(json!(o)).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, &e),
     }
 }
 
@@ -583,7 +611,7 @@ async fn discard_job(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn a_turn_line_has_counts_and_no_text() {
         let extra = serde_json::json!({"steps": 3, "tools": ["web_search", "read_page"], "mode": "native",
@@ -745,7 +773,7 @@ mod tests {
         assert!(!safe_id(&"x".repeat(129)));
     }
 
-    fn with_bot(mut app: crate::App) -> crate::App {
+    pub(crate) fn with_bot(mut app: crate::App) -> crate::App {
         app.bots.insert(
             "nexy".into(),
             crate::bots::Bot {
@@ -930,7 +958,7 @@ mod tests {
         }
     }
 
-    fn test_app(port: u16) -> crate::App {
+    pub(crate) fn test_app(port: u16) -> crate::App {
         crate::App {
             cfg: crate::config::Config {
                 host: "127.0.0.1".into(),

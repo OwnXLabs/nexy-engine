@@ -44,7 +44,22 @@ pub struct Job {
     pub origin: Option<String>,
     /// the owner's zone (IANA name) its clock times are read in; "UTC" for jobs made before zones
     pub tz: String,
+    /// runs when this event arrives instead of on a schedule, such as "mail from=a@example.com"
+    pub trigger: Option<String>,
 }
+
+/// What an event may do with one routine.
+#[derive(Debug, PartialEq)]
+pub enum Claim {
+    Run,
+    /// this event already ran this routine
+    Duplicate,
+    /// over a limit: seconds until it would run
+    Limited(i64),
+}
+
+/// How long event ids are kept to catch repeats.
+const EVENTS_KEPT_SECS: i64 = 30 * 86_400;
 
 pub const PENDING: &str = "pending";
 
@@ -117,7 +132,10 @@ impl Store {
                content TEXT NOT NULL, tool_name TEXT, ts INTEGER NOT NULL, PRIMARY KEY(session_id, seq)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY, bot TEXT NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, bot TEXT NOT NULL, name TEXT NOT NULL, schedule TEXT NOT NULL,
-               prompt TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, next_run_at INTEGER, last_run_at INTEGER, last_status TEXT);",
+               prompt TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, next_run_at INTEGER, last_run_at INTEGER, last_status TEXT);
+             CREATE TABLE IF NOT EXISTS event_runs(job_id INTEGER NOT NULL, user TEXT NOT NULL, source TEXT NOT NULL,
+               event_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(job_id, source, event_id)) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS event_runs_user ON event_runs(user, at);",
         )?;
         for (table, column, ddl) in [
             ("sessions", "user", USER_COL),
@@ -126,6 +144,7 @@ impl Store {
             ("jobs", "status", "TEXT NOT NULL DEFAULT 'active'"),
             ("jobs", "origin", "TEXT"),
             ("jobs", "tz", "TEXT NOT NULL DEFAULT 'UTC'"),
+            ("jobs", "trigger", "TEXT"),
         ] {
             let has: bool = db
                 .prepare(&format!(
@@ -279,7 +298,7 @@ impl Store {
         prompt: &str,
         next: Option<i64>,
     ) -> Result<i64, JobError> {
-        self.insert_job(user, bot, name, schedule, tz, prompt, next, None)
+        self.insert_job(user, bot, name, schedule, tz, prompt, next, None, None)
     }
 
     /// Saved but not scheduled: no next run until the owner confirms it.
@@ -294,7 +313,32 @@ impl Store {
         prompt: &str,
         origin: &str,
     ) -> Result<i64, JobError> {
-        self.insert_job(user, bot, name, schedule, tz, prompt, None, Some(origin))
+        self.insert_job(
+            user,
+            bot,
+            name,
+            schedule,
+            tz,
+            prompt,
+            None,
+            Some(origin),
+            None,
+        )
+    }
+
+    /// A routine an event starts. Never has a next run; pending until confirmed when `origin` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_trigger_job(
+        &self,
+        user: &str,
+        bot: &str,
+        name: &str,
+        trigger: &str,
+        tz: &str,
+        prompt: &str,
+        origin: Option<&str>,
+    ) -> Result<i64, JobError> {
+        self.insert_job(user, bot, name, "", tz, prompt, None, origin, Some(trigger))
     }
 
     /// Counts and inserts under one lock, so parallel requests cannot pass the caps together.
@@ -309,6 +353,7 @@ impl Store {
         prompt: &str,
         next: Option<i64>,
         origin: Option<&str>,
+        trigger: Option<&str>,
     ) -> Result<i64, JobError> {
         let db = self.db.lock().unwrap();
         let count = |sql: &str, v: &str| db.query_row(sql, params![v], |r| r.get::<_, i64>(0));
@@ -324,9 +369,9 @@ impl Store {
         }
         let status = if origin.is_some() { PENDING } else { "active" };
         db.execute(
-            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin, tz)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![user, bot, name, schedule, prompt, next, status, origin, tz],
+            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin, tz, trigger)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![user, bot, name, schedule, prompt, next, status, origin, tz, trigger],
         )?;
         Ok(db.last_insert_rowid())
     }
@@ -336,7 +381,13 @@ impl Store {
     }
 
     /// Owner only, through the API: a pending job becomes active with its first run, in the owner's zone.
-    pub fn confirm_job(&self, user: &str, id: i64, next: i64, tz: &str) -> rusqlite::Result<usize> {
+    pub fn confirm_job(
+        &self,
+        user: &str,
+        id: i64,
+        next: Option<i64>,
+        tz: &str,
+    ) -> rusqlite::Result<usize> {
         self.db.lock().unwrap().execute(
             "UPDATE jobs SET status = 'active', next_run_at = ?3, tz = ?5 WHERE id = ?1 AND user = ?2 AND status = ?4",
             params![id, user, next, PENDING, tz],
@@ -344,10 +395,60 @@ impl Store {
     }
 
     pub fn discard_job(&self, user: &str, id: i64) -> rusqlite::Result<usize> {
-        self.db.lock().unwrap().execute(
+        let db = self.db.lock().unwrap();
+        let n = db.execute(
             "DELETE FROM jobs WHERE id = ?1 AND user = ?2 AND status = ?3",
             params![id, user, PENDING],
-        )
+        )?;
+        forget_events(&db, id, n)
+    }
+
+    /// Checks the limits and records the run under one lock, so parallel deliveries cannot both pass.
+    pub fn claim_event(
+        &self,
+        user: &str,
+        job: i64,
+        source: &str,
+        event: &str,
+        at: i64,
+    ) -> rusqlite::Result<Claim> {
+        use crate::triggers::{ROUTINE_GAP_SECS, RUNS_PER_USER_HOUR};
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "DELETE FROM event_runs WHERE at < ?1",
+            params![at - EVENTS_KEPT_SECS],
+        )?;
+        let seen = db
+            .prepare(
+                "SELECT 1 FROM event_runs WHERE job_id = ?1 AND source = ?2 AND event_id = ?3",
+            )?
+            .exists(params![job, source, event])?;
+        if seen {
+            return Ok(Claim::Duplicate);
+        }
+        let last: Option<i64> = db.query_row(
+            "SELECT MAX(at) FROM event_runs WHERE job_id = ?1",
+            params![job],
+            |r| r.get(0),
+        )?;
+        if let Some(l) = last.filter(|l| at - l < ROUTINE_GAP_SECS) {
+            return Ok(Claim::Limited(l + ROUTINE_GAP_SECS - at));
+        }
+        let (n, oldest): (i64, Option<i64>) = db.query_row(
+            "SELECT COUNT(*), MIN(at) FROM event_runs WHERE user = ?1 AND at > ?2",
+            params![user, at - 3600],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if n >= RUNS_PER_USER_HOUR {
+            return Ok(Claim::Limited(
+                oldest.map_or(3600, |o| o + 3600 - at).max(1),
+            ));
+        }
+        db.execute(
+            "INSERT INTO event_runs(job_id, user, source, event_id, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![job, user, source, event, at],
+        )?;
+        Ok(Claim::Run)
     }
 
     /// Names of the tools that ran in a session, oldest turns included.
@@ -363,7 +464,7 @@ impl Store {
     pub fn jobs(&self, user: Option<&str>) -> rusqlite::Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(
-            "SELECT id, user, bot, name, schedule, prompt, enabled, next_run_at, last_run_at, last_status, status, origin, tz FROM jobs
+            "SELECT id, user, bot, name, schedule, prompt, enabled, next_run_at, last_run_at, last_status, status, origin, tz, trigger FROM jobs
              WHERE ?1 IS NULL OR user = ?1 ORDER BY id",
         )?;
         let rows = st.query_map(params![user], |r| {
@@ -381,6 +482,7 @@ impl Store {
                 status: r.get(10)?,
                 origin: r.get(11)?,
                 tz: r.get(12)?,
+                trigger: r.get(13)?,
             })
         })?;
         rows.collect()
@@ -395,11 +497,21 @@ impl Store {
     }
 
     pub fn delete_job(&self, user: &str, id: i64) -> rusqlite::Result<usize> {
-        self.db.lock().unwrap().execute(
+        let db = self.db.lock().unwrap();
+        let n = db.execute(
             "DELETE FROM jobs WHERE id = ?1 AND user = ?2",
             params![id, user],
-        )
+        )?;
+        forget_events(&db, id, n)
     }
+}
+
+/// A deleted routine's id can be handed out again; its event history must not carry over.
+fn forget_events(db: &Connection, id: i64, deleted: usize) -> rusqlite::Result<usize> {
+    if deleted > 0 {
+        db.execute("DELETE FROM event_runs WHERE job_id = ?1", params![id])?;
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -443,12 +555,12 @@ mod tests {
         assert_eq!(j.origin.as_deref(), Some("read_page"));
         s.finish_job(id, "ok", Some(5)).unwrap();
         assert_eq!(s.job("a", id).unwrap().unwrap().next_run_at, None);
-        assert_eq!(s.confirm_job("b", id, 99, "UTC").unwrap(), 0);
-        assert_eq!(s.confirm_job("a", id, 99, "UTC").unwrap(), 1);
+        assert_eq!(s.confirm_job("b", id, Some(99), "UTC").unwrap(), 0);
+        assert_eq!(s.confirm_job("a", id, Some(99), "UTC").unwrap(), 1);
         let j = s.job("a", id).unwrap().unwrap();
         assert_eq!((j.status.as_str(), j.next_run_at), ("active", Some(99)));
         assert_eq!(
-            s.confirm_job("a", id, 5, "UTC").unwrap(),
+            s.confirm_job("a", id, Some(5), "UTC").unwrap(),
             0,
             "confirms once"
         );

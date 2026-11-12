@@ -136,7 +136,7 @@ pub const ALL: &[Tool] = &[
     Tool {
         name: "routine",
         external: false,
-        desc: "Create, list or delete routines: prompts you run on a schedule for the user.",
+        desc: "Create, list or delete routines: prompts you run for the user on a schedule or when an event arrives.",
         params: &[
             Param {
                 name: "action",
@@ -152,6 +152,11 @@ pub const ALL: &[Tool] = &[
                 name: "schedule",
                 kind: "string?",
                 desc: "in the user's local time (see Now): \"daily 08:00\", \"every 2h\" or cron such as \"0 9 * * 1-5\" (create)",
+            },
+            Param {
+                name: "trigger",
+                kind: "string?",
+                desc: "instead of a schedule, run when an event arrives: \"mail from=alice@example.com\" or 'file folder=\"Invoices\"' (create)",
             },
             Param {
                 name: "prompt",
@@ -499,14 +504,20 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                     let next = j
                         .next_run_at
                         .map_or("-".into(), |t| crate::scheduler::local_at(t, &cx.tz));
+                    let when = match &j.trigger {
+                        Some(t) => format!("on {t}"),
+                        None => j.schedule.clone(),
+                    };
                     format!(
                         "id {}: {} | {} ({}) | {} | {}",
                         j.id,
                         j.name,
-                        j.schedule,
+                        when,
                         j.tz,
                         if j.status == PENDING {
                             "waiting for the user to confirm it".into()
+                        } else if j.trigger.is_some() {
+                            "runs when that event arrives".into()
                         } else {
                             format!("next {next}")
                         },
@@ -521,14 +532,20 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                 return Err("routines can only be created in a conversation with the user".into());
             }
             let (name, schedule, prompt) = (s("name"), s("schedule"), s("prompt"));
-            if schedule.is_empty() || prompt.is_empty() {
-                return Err("create needs \"schedule\" and \"prompt\"".into());
+            let trigger = s("trigger");
+            if (schedule.is_empty() == trigger.is_empty()) || prompt.is_empty() {
+                return Err(
+                    "create needs \"prompt\" and either \"schedule\" or \"trigger\"".into(),
+                );
             }
             let name = if name.is_empty() {
                 prompt.chars().take(40).collect()
             } else {
                 name
             };
+            if !trigger.is_empty() {
+                return trigger_routine(cx, &name, &trigger, &prompt);
+            }
             let next = crate::scheduler::new_schedule(&schedule, &cx.tz, crate::store::now())?;
             let tz = crate::scheduler::zone_name(&cx.tz);
             // outside content can ask for a routine; only the owner can make it run
@@ -578,6 +595,27 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             "unknown action \"{other}\": use create, list or delete"
         )),
     }
+}
+
+/// A trigger lets someone else's mail or files start a run, so one made in chat always waits for
+/// the owner to confirm it in Routines, even in a clean chat.
+fn trigger_routine(cx: &Ctx, name: &str, trigger: &str, prompt: &str) -> Result<String, String> {
+    let t = crate::triggers::parse(trigger)?.to_string();
+    let mut origin = vec!["an event trigger made in chat".to_string()];
+    origin.extend(cx.outside.iter().cloned());
+    let origin: String = origin.join(", ").chars().take(300).collect();
+    let tz = crate::scheduler::zone_name(&cx.tz);
+    let id = cx
+        .store
+        .add_trigger_job(cx.user, cx.bot, name, &t, tz, prompt, Some(&origin))
+        .map_err(|e| e.to_string())?;
+    cx.notes.borrow_mut().push(format!(
+        "The routine \"{name}\" (on {t}) is waiting for you in Routines. It will not run until you confirm it there."
+    ));
+    Ok(format!(
+        "saved routine {id} \"{name}\" (on {t}) but it is NOT active: routines started by events need the user's \
+         confirmation in Routines. Tell the user it is waiting for them there."
+    ))
 }
 
 pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
