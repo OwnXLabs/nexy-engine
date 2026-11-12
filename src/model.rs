@@ -69,12 +69,17 @@ impl Caps {
         (left * 3) as usize
     }
 
+    /// The answer may use at most a quarter of a known context; the rest is the prompt's.
     fn max_tokens(&self, asked: u32) -> u32 {
-        if self.think_off == ThinkOff::StaysOn {
+        let want = if self.think_off == ThinkOff::StaysOn {
             asked.saturating_mul(4)
         } else {
             asked
+        };
+        if self.num_ctx == 0 {
+            return want;
         }
+        want.min(u32::try_from(self.num_ctx / 4).unwrap_or(u32::MAX))
     }
 }
 
@@ -91,6 +96,8 @@ pub struct Reply {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub secs: f64,
+    /// the model stopped at its token limit, not at the end of its answer
+    pub cut: bool,
 }
 
 pub struct Req<'a> {
@@ -259,6 +266,9 @@ impl Backend {
                     r.prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
                     r.completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
                 }
+                if v["choices"][0]["finish_reason"] == "length" {
+                    r.cut = true;
+                }
                 let d = &v["choices"][0]["delta"];
                 if let Some(t) = d["content"].as_str().filter(|t| !t.is_empty()) {
                     r.content.push_str(t);
@@ -294,6 +304,7 @@ impl Backend {
             prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
             completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
             secs: 0.0,
+            cut: v["choices"][0]["finish_reason"] == "length",
         })
     }
 
@@ -338,6 +349,7 @@ impl Backend {
                 if v["done"] == true {
                     r.prompt_tokens = v["prompt_eval_count"].as_u64().unwrap_or(0);
                     r.completion_tokens = v["eval_count"].as_u64().unwrap_or(0);
+                    r.cut = v["done_reason"] == "length";
                 }
             })?;
             return Ok(r);
@@ -353,6 +365,7 @@ impl Backend {
             prompt_tokens: v["prompt_eval_count"].as_u64().unwrap_or(0),
             completion_tokens: v["eval_count"].as_u64().unwrap_or(0),
             secs: 0.0,
+            cut: v["done_reason"] == "length",
         })
     }
 
@@ -634,6 +647,25 @@ mod tests {
             "a.txt"
         );
         assert_eq!(out[1]["tool_name"], "read_file");
+    }
+
+    #[test]
+    fn the_answer_keeps_three_quarters_of_the_context_for_the_prompt() {
+        let at = |num_ctx, think_off| Caps {
+            num_ctx,
+            think_off,
+            ..Default::default()
+        };
+        let plain = at(16_384, ThinkOff::NoThinking);
+        assert_eq!(plain.max_tokens(4096), 4096);
+        assert_eq!(plain.prompt_chars(4096), 12_288 * 3);
+        assert_eq!(at(16_384, ThinkOff::StaysOn).max_tokens(4096), 4096);
+        assert_eq!(
+            at(8_192, ThinkOff::NoThinking).prompt_chars(4096),
+            6_144 * 3
+        );
+        assert_eq!(at(32_768, ThinkOff::StaysOn).max_tokens(4096), 8192);
+        assert_eq!(at(0, ThinkOff::StaysOn).max_tokens(4096), 16_384);
     }
 
     #[test]
