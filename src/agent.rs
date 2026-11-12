@@ -191,6 +191,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
         app,
         cx: Ctx {
             used: Default::default(),
+            asked_at: Default::default(),
             user: input.user,
             bot: &bot.name,
             store,

@@ -498,10 +498,11 @@ async fn create_job(
     };
     let name = zone_name(&tz);
     let made = match (j.schedule.as_deref(), j.trigger.as_deref()) {
+        // stored as read: "weekdays 07:30" is kept as "30 7 * * 1-5"
         (Some(schedule), None) => match new_schedule(schedule, &tz, now()) {
-            Ok(next) => app
+            Ok((schedule, next)) => app
                 .store
-                .add_job(&user, &bot, &j.name, schedule, name, &j.prompt, Some(next))
+                .add_job(&user, &bot, &j.name, &schedule, name, &j.prompt, Some(next))
                 .map(|id| json!({"id": id, "name": j.name, "schedule": schedule, "tz": name, "next_run_at": next})),
             Err(e) => return err(StatusCode::BAD_REQUEST, &e),
         },
@@ -576,7 +577,7 @@ async fn confirm_job(
     let next = match job.trigger {
         Some(_) => None,
         None => match new_schedule(&job.schedule, &tz, now()) {
-            Ok(n) => Some(n),
+            Ok((_, n)) => Some(n),
             Err(e) => return err(StatusCode::BAD_REQUEST, &e),
         },
     };

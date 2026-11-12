@@ -669,6 +669,7 @@ mod tests {
         let app = app();
         let cx = crate::tools::Ctx {
             used: Default::default(),
+            asked_at: Default::default(),
             user: "a",
             bot: "nexy",
             store: &app.store,

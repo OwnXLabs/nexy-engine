@@ -53,30 +53,130 @@ pub fn now_line(tz: &TimeZone) -> String {
     format!("{} (the user's local time)", local_at(now(), tz))
 }
 
+/// A schedule as it is stored: "every 30m", "daily 08:15" or 5-field cron. Also takes
+/// "weekdays 07:30", "weekends 9am", "monday 18:45", and cron with the time in the hour field
+/// ("0 7:30 * * 1-5" is 07:30, not 07:00). Anything else is refused, never read as another time.
+pub fn canonical(schedule: &str) -> Result<String, String> {
+    let s = schedule
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if let Some(rest) = s.strip_prefix("every ")
+        && rest.len() >= 2
+        && rest.is_ascii()
+        && rest[..rest.len() - 1]
+            .trim()
+            .parse::<i64>()
+            .is_ok_and(|n| n > 0)
+        && matches!(&rest[rest.len() - 1..], "m" | "h" | "d")
+    {
+        return Ok(format!("every {}", rest.replace(' ', "")));
+    }
+    if let Some(c) = friendly(&s) {
+        return c.ok_or_else(|| bad(schedule));
+    }
+    let f: Vec<&str> = s.split(' ').collect();
+    let cron = match f.as_slice() {
+        // the time written into the hour field: "0 7:30 * * 1-5"
+        ["0" | "00", hm, rest @ ..] if rest.len() == 3 && hm.contains(':') => {
+            let (h, m) = clock(hm).ok_or_else(|| bad(schedule))?;
+            format!("{m} {h} {}", rest.join(" "))
+        }
+        // or in place of minute and hour: "7:30 * * 1-5"
+        [hm, rest @ ..] if rest.len() == 3 && hm.contains(':') => {
+            let (h, m) = clock(hm).ok_or_else(|| bad(schedule))?;
+            format!("{m} {h} {}", rest.join(" "))
+        }
+        _ => s.clone(),
+    };
+    Cron::parse(&cron)
+        .map(|_| cron)
+        .ok_or_else(|| bad(schedule))
+}
+
+/// "daily 08:15", "weekdays 7:30 am", "every monday at 18:45": `None` when it is not of this form,
+/// `Some(None)` when it is but the time is not a time.
+fn friendly(s: &str) -> Option<Option<String>> {
+    let s = s.strip_prefix("every ").unwrap_or(s);
+    let (days, at) = s.split_once(' ')?;
+    let dow = match days.trim_end_matches(',') {
+        "daily" | "day" => "*".to_string(),
+        "weekday" | "weekdays" => "1-5".into(),
+        "weekend" | "weekends" => "0,6".into(),
+        d => {
+            let d = d.strip_suffix('s').filter(|x| x.len() > 2).unwrap_or(d);
+            let i = DAYS
+                .iter()
+                .position(|n| d.starts_with(n) && DAY_NAMES.iter().any(|f| f.starts_with(d)))?;
+            i.to_string()
+        }
+    };
+    let at = at.trim().strip_prefix("at ").unwrap_or(at.trim());
+    Some(clock(at).map(|(h, m)| {
+        if dow == "*" {
+            format!("daily {h:02}:{m:02}")
+        } else {
+            format!("{m} {h} * * {dow}")
+        }
+    }))
+}
+
+const DAY_NAMES: [&str; 7] = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+];
+
+/// "7:30", "07:30", "7:30 pm", "7pm", "19:05" as (hour, minute).
+pub fn clock(t: &str) -> Option<(u32, u32)> {
+    let t = t.trim().replace(' ', "");
+    let (t, half) = match t.strip_suffix("am").or_else(|| t.strip_suffix("a.m.")) {
+        Some(x) => (x.to_string(), Some(0)),
+        None => match t.strip_suffix("pm").or_else(|| t.strip_suffix("p.m.")) {
+            Some(x) => (x.to_string(), Some(12)),
+            None => (t, None),
+        },
+    };
+    let num = |v: &str| {
+        (!v.is_empty() && v.len() <= 2 && v.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| v.parse::<u32>().ok())
+            .flatten()
+    };
+    let (h, m) = match t.split_once(':') {
+        Some((h, m)) if m.len() == 2 => (num(h)?, num(m)?),
+        Some(_) => return None,
+        None if half.is_some() => (num(&t)?, 0),
+        None => return None,
+    };
+    let h = match half {
+        Some(add) if (1..=12).contains(&h) => h % 12 + add,
+        Some(_) => return None,
+        None => h,
+    };
+    (h <= 23 && m <= 59).then_some((h, m))
+}
+
 /// When a schedule next runs after `from`. Clock times ("daily 08:00", cron) are read in `tz`.
 pub fn next_run(schedule: &str, tz: &TimeZone, from: i64) -> Result<i64, String> {
-    let s = schedule.trim().to_lowercase();
+    let s = canonical(schedule)?;
     if let Some(rest) = s.strip_prefix("every ") {
-        let rest = rest.trim();
-        if rest.len() < 2 || !rest.is_ascii() {
-            return Err(bad(schedule));
-        }
         let (num, unit) = rest.split_at(rest.len() - 1);
-        let n: i64 = num.trim().parse().map_err(|_| bad(schedule))?;
+        let n: i64 = num.parse().map_err(|_| bad(schedule))?;
         let secs = match unit {
             "m" => 60,
             "h" => 3600,
-            "d" => 86_400,
-            _ => return Err(bad(schedule)),
+            _ => 86_400,
         };
-        if n <= 0 {
-            return Err(bad(schedule));
-        }
         return Ok(from + n * secs);
     }
     let cron = match s.strip_prefix("daily ") {
         Some(t) => {
-            let (h, m) = t.trim().split_once(':').ok_or_else(|| bad(schedule))?;
+            let (h, m) = t.split_once(':').ok_or_else(|| bad(schedule))?;
             format!("{m} {h} * * *")
         }
         None => s,
@@ -89,9 +189,10 @@ pub fn next_run(schedule: &str, tz: &TimeZone, from: i64) -> Result<i64, String>
 pub const MIN_GAP_MINS: i64 = 5;
 
 /// A schedule for a new routine: valid, and no more often than every MIN_GAP_MINS minutes.
-pub fn new_schedule(schedule: &str, tz: &TimeZone, from: i64) -> Result<i64, String> {
-    let next = next_run(schedule, tz, from)?;
-    let s = schedule.trim().to_lowercase();
+/// Gives the schedule to store and its first run.
+pub fn new_schedule(schedule: &str, tz: &TimeZone, from: i64) -> Result<(String, i64), String> {
+    let s = canonical(schedule)?;
+    let next = next_run(&s, tz, from)?;
     let gap = if s.starts_with("every ") {
         (next - from) / 60
     } else if s.starts_with("daily ") {
@@ -104,12 +205,27 @@ pub fn new_schedule(schedule: &str, tz: &TimeZone, from: i64) -> Result<i64, Str
             "\"{schedule}\" runs too often: routines run at most every {MIN_GAP_MINS} minutes"
         ));
     }
-    Ok(next)
+    Ok((s, next))
 }
+
+/// The one clock time a stored schedule runs at each day it runs, if it has exactly one.
+pub fn time_of_day(canonical: &str) -> Option<(u32, u32)> {
+    if let Some(t) = canonical.strip_prefix("daily ") {
+        return clock(t);
+    }
+    let f: Vec<&str> = canonical.split(' ').collect();
+    match f.as_slice() {
+        [m, h, _, _, _] => Some((h.parse().ok()?, m.parse().ok()?)),
+        _ => None,
+    }
+}
+
+pub const UNSUPPORTED: &str = "unsupported schedule";
 
 fn bad(s: &str) -> String {
     format!(
-        "unsupported schedule \"{s}\": use \"every 30m\", \"every 2h\", \"daily 08:00\" or 5-field cron such as \"0 9 * * 1-5\" (in the owner's time zone)"
+        "{UNSUPPORTED} \"{s}\": use \"daily 08:15\", \"weekdays 07:30\", \"every 30m\", \"every 2h\" or 5-field cron \
+         \"minute hour day month weekday\" such as \"30 7 * * 1-5\" (07:30 on weekdays), in the owner's time zone"
     )
 }
 
@@ -415,6 +531,66 @@ mod tests {
             next_run("every 1m", &UTC, t).unwrap(),
             t + 60,
             "existing routines still run"
+        );
+    }
+
+    /// QA 0.2.9: a time with minutes is read as that time, in the forms a model writes it;
+    /// one that cannot be read is refused, never taken as another time.
+    #[test]
+    fn minutes_are_kept() {
+        use super::canonical;
+        for (said, kept) in [
+            ("0 7:30 * * 1-5", "30 7 * * 1-5"),
+            ("7:30 * * 1-5", "30 7 * * 1-5"),
+            ("weekdays 07:30", "30 7 * * 1-5"),
+            ("every weekday at 7:30 am", "30 7 * * 1-5"),
+            ("Weekdays 7:30PM", "30 19 * * 1-5"),
+            ("daily 08:15", "daily 08:15"),
+            ("daily 8:15", "daily 08:15"),
+            ("every day at 12am", "daily 00:00"),
+            ("monday 18:45", "45 18 * * 1"),
+            ("every friday at 9pm", "0 21 * * 5"),
+            ("weekends 9am", "0 9 * * 0,6"),
+            ("30 7 * * 1-5", "30 7 * * 1-5"),
+            ("0  9 * *  MON-FRI", "0 9 * * mon-fri"),
+            ("every 2 h", "every 2h"),
+        ] {
+            assert_eq!(canonical(said).as_deref(), Ok(kept), "{said}");
+        }
+        for bad in [
+            "15 7:30 * * 1-5",
+            "* 7:30 * * *",
+            "0 7:30 * * 1-5 *",
+            "weekdays 7",
+            "daily 7:3",
+            "daily 24:00",
+            "weekdays 13pm",
+            "at 7:30 on weekdays",
+            "every day at half past seven",
+            "every 2x",
+            "every 2ü",
+            "someday 07:30",
+        ] {
+            let e = canonical(bad).unwrap_err();
+            assert!(
+                e.contains("\"30 7 * * 1-5\"") && e.contains("weekdays 07:30"),
+                "{bad}: {e}"
+            );
+        }
+        // Fri 6 Nov 2026 18:00 in Manila: next weekday 7:30 is Monday's
+        let from = utc("2026-11-06T10:00:00Z");
+        let manila = zone("Asia/Manila").unwrap();
+        for s in ["0 7:30 * * 1-5", "weekdays 07:30"] {
+            let t = next_run(s, &manila, from).unwrap();
+            assert_eq!(
+                super::local_at(t, &manila),
+                "Mon 2026-11-09 07:30 Asia/Manila",
+                "{s}"
+            );
+        }
+        assert_eq!(
+            new_schedule("0 7:30 * * 1-5", &manila, from).unwrap().0,
+            "30 7 * * 1-5"
         );
     }
 

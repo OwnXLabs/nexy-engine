@@ -151,7 +151,7 @@ pub const ALL: &[Tool] = &[
             Param {
                 name: "schedule",
                 kind: "string?",
-                desc: "in the user's local time (see Now): \"daily 08:00\", \"every 2h\" or cron such as \"0 9 * * 1-5\" (create)",
+                desc: "in the user's local time (see Now), minutes included: \"daily 08:15\", \"weekdays 07:30\", \"every 2h\", or 5-field cron \"minute hour day month weekday\" such as \"30 7 * * 1-5\" for 7:30 on weekdays (create)",
             },
             Param {
                 name: "trigger",
@@ -392,6 +392,8 @@ pub struct Ctx<'a> {
     pub tz: jiff::tz::TimeZone,
     /// tools that reach the internet, run so far this answer (see `over_limit`)
     pub used: RefCell<Vec<&'static str>>,
+    /// clock times named in schedules refused this answer: a routine is made at one of them or not at all
+    pub asked_at: RefCell<Vec<(u32, u32)>>,
 }
 
 impl Tool {
@@ -482,10 +484,11 @@ pub fn fence(tool: &str, out: &str) -> String {
 
 /// Adds what tools asked to tell the owner, unless the reply already points them to it.
 pub fn with_notes(cx: &Ctx, text: &mut String) {
-    if text.contains("Routines") {
-        return;
-    }
+    let points = text.contains("Routines");
     for n in cx.notes.borrow().iter() {
+        if text.contains(n.as_str()) || (points && n.contains("Routines")) {
+            continue;
+        }
         text.push_str("\n\n");
         text.push_str(n);
     }
@@ -553,7 +556,7 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             if !trigger.is_empty() {
                 return trigger_routine(cx, &name, &trigger, &prompt);
             }
-            let next = crate::scheduler::new_schedule(&schedule, &cx.tz, crate::store::now())?;
+            let (schedule, next) = saved_schedule(cx, &schedule)?;
             let tz = crate::scheduler::zone_name(&cx.tz);
             // outside content can ask for a routine; only the owner can make it run
             if !cx.outside.is_empty() {
@@ -574,9 +577,17 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                 .store
                 .add_job(cx.user, cx.bot, &name, &schedule, tz, &prompt, Some(next))
                 .map_err(|e| e.to_string())?;
+            let (when, first) = (
+                when_text(&schedule),
+                crate::scheduler::local_at(next, &cx.tz),
+            );
+            // the reply says what was saved, whatever the model makes of it
+            cx.notes.borrow_mut().push(format!(
+                "Routine saved: \"{name}\", {when}. First run {first}."
+            ));
             Ok(format!(
-                "created routine {id} \"{name}\" ({schedule}, {tz}); first run {}",
-                crate::scheduler::local_at(next, &cx.tz)
+                "created routine {id} \"{name}\" ({schedule}, {tz}): runs {when}; first run {first}. \
+                 Tell the user it runs {when}."
             ))
         }
         "delete" => {
@@ -602,6 +613,39 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             "unknown action \"{other}\": use create, list or delete"
         )),
     }
+}
+
+/// The schedule to store and its first run. A schedule that cannot be read is refused, and the
+/// time it named is kept: a later try this turn at another time is refused too, so a routine the
+/// owner asked for at 7:30 is never quietly saved at 7:00 (QA 0.2.9).
+fn saved_schedule(cx: &Ctx, schedule: &str) -> Result<(String, i64), String> {
+    use crate::scheduler::{UNSUPPORTED, clock, new_schedule, time_of_day};
+    let (stored, next) = match new_schedule(schedule, &cx.tz, crate::store::now()) {
+        Ok(v) => v,
+        Err(e) if e.starts_with(UNSUPPORTED) => {
+            let times = schedule
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|w| w.contains(':'))
+                .filter_map(clock);
+            cx.asked_at.borrow_mut().extend(times);
+            return Err(format!(
+                "not created: {e}. Nothing was saved. Keep the time the user asked for: send it again in one of \
+                 these forms, or ask the user. Never save a different time instead."
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let asked = cx.asked_at.borrow();
+    if let Some(&(h, m)) = asked.first()
+        && !time_of_day(&stored).is_some_and(|t| asked.contains(&t))
+    {
+        return Err(format!(
+            "not created: the user asked for {h:02}:{m:02}, and \"{schedule}\" is another time. Nothing was saved. \
+             Send {h:02}:{m:02} itself, such as \"{m} {h} * * 1-5\" for weekdays or \"daily {h:02}:{m:02}\", \
+             or ask the user."
+        ));
+    }
+    Ok((stored, next))
 }
 
 /// A routine for the same thing made this recently is the same request made twice: Nexy set it from
@@ -667,6 +711,7 @@ fn when_text(schedule: &str) -> String {
     match f[4] {
         "*" => format!("every day at {at}"),
         "1-5" => format!("every weekday at {at}"),
+        "0,6" | "6,0" => format!("every Saturday and Sunday at {at}"),
         d => match d.parse::<usize>().ok().and_then(|n| DAYS.get(n % 7)) {
             Some(day) => format!("every {day} at {at}"),
             None => schedule.to_string(),
@@ -1347,6 +1392,7 @@ mod tests {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let cx = |user, owner| Ctx {
             used: Default::default(),
+            asked_at: Default::default(),
             user,
             bot: "nexy",
             store: &store,
@@ -1426,6 +1472,7 @@ mod tests {
     fn clean<'a>(store: &'a Store) -> Ctx<'a> {
         Ctx {
             used: Default::default(),
+            asked_at: Default::default(),
             user: "a",
             bot: "nexy",
             store,
@@ -1491,7 +1538,11 @@ mod tests {
         let j = &store.jobs(Some("a")).unwrap()[0];
         assert_eq!(j.status, "active");
         assert!(j.next_run_at.is_some());
-        assert!(cx.notes.borrow().is_empty());
+        let notes = cx.notes.borrow();
+        assert!(
+            notes.len() == 1 && notes[0].starts_with("Routine saved: \"brief\", every 1h."),
+            "only what was saved, nothing waiting: {notes:?}"
+        );
     }
 
     #[test]
@@ -1776,6 +1827,64 @@ mod tests {
             again.contains("when mail from=boss@example.com arrives"),
             "{again}"
         );
+    }
+
+    /// QA 0.2.9: "remind me every weekday at 7:30 to check the fridge temperature". The model sent
+    /// "0 7:30 * * 1-5", was refused, saved "0 7 * * 1-5" (07:00) and told the owner it only does
+    /// whole hours.
+    #[test]
+    fn a_time_with_minutes_is_kept_never_changed() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut cx = clean(&store);
+        cx.tz = crate::scheduler::zone("Asia/Manila").unwrap();
+        let t = find("routine").unwrap();
+        let schedule_help = t.params.iter().find(|p| p.name == "schedule").unwrap().desc;
+        assert!(
+            schedule_help.contains("\"30 7 * * 1-5\"") && schedule_help.contains("07:30"),
+            "the tool shows a time with minutes: {schedule_help}"
+        );
+        let make = |s: &str| json!({"action": "create", "name": "fridge", "schedule": s, "prompt": "Remind me to check the fridge temperature."});
+        let out = run(t, &make("0 7:30 * * 1-5"), &cx).unwrap();
+        assert!(out.contains("every weekday at 07:30"), "{out}");
+        let j = &store.jobs(Some("a")).unwrap()[0];
+        assert_eq!(j.schedule, "30 7 * * 1-5", "stored as it runs");
+        assert!(
+            crate::scheduler::local_at(j.next_run_at.unwrap(), &cx.tz)
+                .ends_with(" 07:30 Asia/Manila")
+        );
+        let mut reply = "Done.".to_string();
+        with_notes(&cx, &mut reply);
+        assert!(
+            reply.contains("Routine saved: \"fridge\", every weekday at 07:30. First run "),
+            "the reply states what was saved: {reply}"
+        );
+
+        // a schedule it cannot read is refused, and no other time is taken in its place
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut cx = clean(&store);
+        cx.tz = crate::scheduler::zone("Asia/Manila").unwrap();
+        let e = run(t, &make("at 7:30 on weekdays"), &cx).unwrap_err();
+        assert!(
+            e.contains("Nothing was saved") && e.contains("Never save a different time"),
+            "{e}"
+        );
+        for other in ["0 7 * * 1-5", "0 8 * * 1-5", "every 24h", "daily 07:00"] {
+            let e = run(t, &make(other), &cx).unwrap_err();
+            assert!(
+                e.contains("asked for 07:30") && e.contains("\"30 7 * * 1-5\""),
+                "{other}: {e}"
+            );
+        }
+        assert!(
+            store.jobs(Some("a")).unwrap().is_empty(),
+            "a routine at another time was saved"
+        );
+        assert!(
+            cx.notes.borrow().is_empty(),
+            "nothing saved, nothing said saved"
+        );
+        run(t, &make("weekdays 07:30"), &cx).unwrap();
+        assert_eq!(store.jobs(Some("a")).unwrap()[0].schedule, "30 7 * * 1-5");
     }
 
     #[test]
