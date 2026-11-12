@@ -190,6 +190,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
     let mut r = Run {
         app,
         cx: Ctx {
+            used: Default::default(),
             user: input.user,
             bot: &bot.name,
             store,
