@@ -105,14 +105,21 @@ whose `Host` is `127.0.0.1`, `localhost` or `[::1]` on its own port, or a name l
   neither is a tool. `GET /api/jobs` lists `status` and `origin`. A caller whose system message
   holds only its own text sends `"context_clean": true` (chat completions) or
   `metadata.context_clean` (responses).
+- Pause and resume: `POST /api/jobs/{id}/pause` stops a routine running on its schedule or on
+  events; `POST /api/jobs/{id}/resume` starts it again, with a schedule's next run counted from
+  now, so runs missed while paused never fire. A pending routine is neither (`409`: confirm it
+  first). Like confirm, neither is a tool; `GET /api/jobs` shows `enabled`.
 - Writes after outside content: once a web page, search result or passed-in content is in a
   chat's context, `write_file`, `edit_file`, `remember` and `run` are refused for the rest of that
   chat, and the reply tells the owner, who can ask again in a new chat. Reading the workspace or
   saved facts does not block writes, since only the owner or a clean turn put things there.
 - Event triggers: a routine can run when an event arrives instead of on a schedule. Send
   `"trigger": "mail from=alice@example.com"` (or `'file folder="Invoices 2026"'`) in place of
-  `schedule` with `POST /api/jobs`: a source name, then fields that must all be equal, ignoring
-  case. The caller that watches the source (the connector hub) posts each event to
+  `schedule` with `POST /api/jobs`: a source name, then conditions that must all hold, ignoring
+  case: `key=value` is equal, `from=@acme.com` is any address whose domain is exactly `acme.com`
+  (not `evil-acme.com` or `acme.com.evil.io`), and `subject~invoice` is contains. Patterns are
+  checked when the routine is made: no empty or wildcard-only values, `~` values up to 100 bytes,
+  and no `~` on address fields. The caller that watches the source (the connector hub) posts each event to
   `POST /api/events` as `{"source": "mail", "id": "<the source's own id>", "fields": {"from":
   "alice@example.com"}, "text": "…"}`, with fields normalised (a bare address, a folder's name)
   and text capped at 8,000 bytes. The answer lists the routines `started`, those this event

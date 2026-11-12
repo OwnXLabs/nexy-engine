@@ -28,6 +28,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/jobs/{id}", delete(delete_job))
         .route("/api/jobs/{id}/confirm", post(confirm_job))
         .route("/api/jobs/{id}/discard", post(discard_job))
+        .route("/api/jobs/{id}/pause", post(pause_job))
+        .route("/api/jobs/{id}/resume", post(resume_job))
         .route("/api/events", post(event))
         .route("/api/probe", post(probe));
     Router::new()
@@ -589,6 +591,58 @@ async fn confirm_job(
     }
 }
 
+/// The owner pauses a routine: it runs neither on its clock nor on events until resumed.
+async fn pause_job(
+    State(app): S,
+    User(user): User,
+    Path(p): Path<HashMap<String, String>>,
+) -> Response {
+    set_enabled(&app, &user, job_id(&p), false)
+}
+
+/// The owner resumes a paused routine. Only this API reaches it, never a tool. A schedule's next
+/// run counts from now, so runs missed while paused never fire in a burst.
+async fn resume_job(
+    State(app): S,
+    User(user): User,
+    Path(p): Path<HashMap<String, String>>,
+) -> Response {
+    set_enabled(&app, &user, job_id(&p), true)
+}
+
+fn set_enabled(app: &App, user: &str, id: i64, on: bool) -> Response {
+    let job = match app.store.job(user, id) {
+        Ok(Some(j)) => j,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "no routine with that id"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if job.status == PENDING {
+        return err(
+            StatusCode::CONFLICT,
+            "this routine is waiting for confirmation: confirm or discard it",
+        );
+    }
+    let next = if !on {
+        None
+    } else if job.enabled {
+        job.next_run_at
+    } else if job.trigger.is_some() {
+        None
+    } else {
+        match zone(&job.tz).and_then(|tz| crate::scheduler::next_run(&job.schedule, &tz, now())) {
+            Ok(n) => Some(n),
+            Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+        }
+    };
+    match app.store.set_enabled(user, id, on, next) {
+        Ok(0) => err(StatusCode::NOT_FOUND, "no routine with that id"),
+        Ok(_) => {
+            Json(json!({"job": {"id": id, "enabled": on, "next_run_at": next}})).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// An event from a source the caller trusts to report it (the connector hub). It starts only the
 /// user's active routines whose trigger matches, each as a tainted run.
 async fn event(State(app): S, User(user): User, Json(e): Json<crate::triggers::Event>) -> Response {
@@ -1064,5 +1118,97 @@ pub(crate) mod tests {
         let jobs = app.store.jobs(Some("owner")).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!((jobs[0].id, jobs[0].status.as_str()), (wait, "active"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_pauses_and_resumes_a_routine() {
+        use crate::scheduler::due;
+        use crate::store::now;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = std::sync::Arc::new(test_app(l.local_addr().unwrap().port()));
+        let s = &app.store;
+        let clock = s
+            .add_job("owner", "nexy", "c", "every 1h", "UTC", "p", Some(1))
+            .unwrap();
+        let wait = s
+            .add_pending_job("owner", "nexy", "w", "every 1h", "UTC", "p", "x")
+            .unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let srv = tokio::spawn(axum::serve(l, super::router(app.clone())).into_future());
+        let call = move |path: String, user: &'static str| {
+            let base = base.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let r = ureq::post(&format!("{base}{path}"))
+                        .set("x-nexy-user", user)
+                        .call();
+                    match r {
+                        Ok(r) => (r.status(), r.into_json::<serde_json::Value>().unwrap()),
+                        Err(ureq::Error::Status(c, r)) => (c, json!(r.into_string().unwrap())),
+                        Err(e) => panic!("{e}"),
+                    }
+                })
+                .await
+                .unwrap()
+            }
+        };
+        use serde_json::json;
+        let job = |id| s.job("owner", id).unwrap().unwrap();
+        // the run was due long ago
+        assert_eq!(due(s.jobs(None).unwrap(), now()).len(), 1);
+        assert_eq!(
+            call(format!("/api/jobs/{clock}/pause"), "other").await.0,
+            404
+        );
+        assert!(job(clock).enabled, "another user cannot pause it");
+        let (code, b) = call(format!("/api/jobs/{clock}/pause"), "owner").await;
+        assert_eq!(code, 200, "{b}");
+        assert_eq!(b["job"]["enabled"], false);
+        assert!(!job(clock).enabled);
+        assert!(
+            due(s.jobs(None).unwrap(), i64::MAX).is_empty(),
+            "a paused routine is never due"
+        );
+        assert_eq!(s.start_job(clock, None).unwrap(), 0);
+        assert_eq!(
+            call(format!("/api/jobs/{clock}/resume"), "other").await.0,
+            404
+        );
+        assert!(!job(clock).enabled, "another user cannot resume it");
+        let before = now();
+        let (code, b) = call(format!("/api/jobs/{clock}/resume"), "owner").await;
+        assert_eq!(code, 200, "{b}");
+        let next = job(clock).next_run_at.unwrap();
+        assert!(job(clock).enabled);
+        assert_eq!(b["job"]["next_run_at"], next);
+        assert!(
+            next >= before + 3600 - 5 && next <= now() + 3600,
+            "next run counts from now: {next}"
+        );
+        assert!(
+            due(s.jobs(None).unwrap(), now()).is_empty(),
+            "missed runs do not fire on resume"
+        );
+        // resuming again changes nothing
+        assert_eq!(
+            call(format!("/api/jobs/{clock}/resume"), "owner").await.0,
+            200
+        );
+        assert_eq!(job(clock).next_run_at, Some(next));
+        // a pending routine is confirmed, never resumed
+        for a in ["resume", "pause"] {
+            assert_eq!(
+                call(format!("/api/jobs/{wait}/{a}"), "owner").await.0,
+                409,
+                "{a}"
+            );
+        }
+        let w = job(wait);
+        assert_eq!(
+            (w.status.as_str(), w.next_run_at),
+            (crate::store::PENDING, None)
+        );
+        assert_eq!(call("/api/jobs/999/resume".into(), "owner").await.0, 404);
+        srv.abort();
     }
 }

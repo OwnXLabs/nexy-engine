@@ -156,7 +156,7 @@ pub const ALL: &[Tool] = &[
             Param {
                 name: "trigger",
                 kind: "string?",
-                desc: "instead of a schedule, run when an event arrives: \"mail from=alice@example.com\" or 'file folder=\"Invoices\"' (create)",
+                desc: "instead of a schedule, run when an event arrives: \"mail from=alice@example.com\", \"mail from=@example.com\" (anyone at that domain), \"mail subject~invoice\" (subject contains) or 'file folder=\"Invoices\"' (create)",
             },
             Param {
                 name: "prompt",
@@ -516,6 +516,8 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                         j.tz,
                         if j.status == PENDING {
                             "waiting for the user to confirm it".into()
+                        } else if !j.enabled {
+                            "paused by the user; only they can resume it, in Routines".into()
                         } else if j.trigger.is_some() {
                             "runs when that event arrives".into()
                         } else {
@@ -1438,6 +1440,38 @@ mod tests {
         let body = &SRC[..SRC.find("#[cfg(test)]").unwrap()];
         assert!(!body.contains("confirm_job"), "a tool reaches confirm_job");
         assert!(public_host("http://127.0.0.1:8650/api/jobs/1/confirm").is_err());
+    }
+
+    #[test]
+    fn resuming_is_not_a_tool() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let cx = clean(&store);
+        let id = store
+            .add_job("a", "nexy", "j", "every 1h", "UTC", "p", Some(1))
+            .unwrap();
+        store.set_enabled("a", id, false, None).unwrap();
+        let t = find("routine").unwrap();
+        for action in [
+            "resume", "unpause", "un-pause", "enable", "start", "pause", "update",
+        ] {
+            let args = json!({"action": action, "id": id, "enabled": true});
+            assert!(run(t, &args, &cx).is_err(), "{action}");
+        }
+        let j = store.job("a", id).unwrap().unwrap();
+        assert_eq!((j.enabled, j.next_run_at), (false, None));
+        let listed = run(t, &json!({"action": "list"}), &cx).unwrap();
+        assert!(listed.contains("paused by the user"), "{listed}");
+        for tool in ALL {
+            let all = format!("{} {} {:?}", tool.name, tool.desc, tool.schema()).to_lowercase();
+            assert!(
+                !all.contains("resume") && !all.contains("pause") && !all.contains("enable"),
+                "{} offers resuming",
+                tool.name
+            );
+        }
+        let body = &SRC[..SRC.find("#[cfg(test)]").unwrap()];
+        assert!(!body.contains("set_enabled"), "a tool reaches set_enabled");
+        assert!(public_host("http://127.0.0.1:8650/api/jobs/1/resume").is_err());
     }
 
     fn ws(name: &str) -> PathBuf {

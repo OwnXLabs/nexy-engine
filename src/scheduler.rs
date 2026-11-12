@@ -275,9 +275,14 @@ pub async fn run(app: Arc<App>) {
                 }
             };
             let next = next_run(&job.schedule, &tz, now()).ok();
-            if let Err(e) = app.store.finish_job(job.id, "running", next) {
-                eprintln!("scheduler: job {}: {e}", job.id);
-                continue;
+            // paused or deleted since the read: it does not run
+            match app.store.start_job(job.id, next) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("scheduler: job {}: {e}", job.id);
+                    continue;
+                }
             }
             start(app.clone(), job, tz, next, None);
         }

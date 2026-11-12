@@ -17,13 +17,36 @@ const MAX_FIELDS: usize = 16;
 const FIELD_CAP: usize = 500;
 const MAX_CONDITIONS: usize = 8;
 
-/// "mail from=alice@example.com" or `file folder="Invoices 2026"`: a source, then fields that
-/// must all be equal (ignoring case) in the event.
+/// Values a `~` pattern may hold: a phrase, not a page.
+const CONTAINS_CAP: usize = 100;
+
+/// "mail from=alice@example.com", "mail from=@acme.com subject~invoice" or
+/// `file folder="Invoices 2026"`: a source, then conditions that must all hold in the event.
 #[derive(Debug, PartialEq)]
 pub struct Trigger {
     pub source: String,
-    pub when: Vec<(String, String)>,
+    pub when: Vec<Cond>,
 }
+
+#[derive(Debug, PartialEq)]
+pub struct Cond {
+    pub key: String,
+    pub op: Op,
+    pub value: String,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Op {
+    /// `key=value`: equal, ignoring case
+    Is,
+    /// `key=@acme.com`: an address whose domain is exactly this one
+    Domain,
+    /// `key~value`: contains, ignoring case
+    Has,
+}
+
+/// Fields holding addresses: a substring of one is a lookalike domain away from a stranger.
+const ADDRESS_FIELDS: [&str; 4] = ["from", "to", "cc", "reply_to"];
 
 fn word(s: &str) -> bool {
     !s.is_empty()
@@ -32,10 +55,31 @@ fn word(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
 }
 
+/// "acme.com": dotted labels of letters, digits and hyphens, nothing else.
+fn domain(d: &str) -> bool {
+    d.len() <= 253
+        && d.contains('.')
+        && d.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// The domain of a bare address: after its last @, with something before it.
+fn domain_of(addr: &str) -> Option<&str> {
+    addr.rsplit_once('@')
+        .filter(|(local, _)| !local.is_empty())
+        .map(|(_, d)| d)
+}
+
 pub fn parse(spec: &str) -> Result<Trigger, String> {
     let bad = |why: &str| {
         format!(
-            "trigger \"{spec}\": {why}; use a source and fields, such as \"mail from=alice@example.com\" or 'file folder=\"Invoices\"'"
+            "trigger \"{spec}\": {why}; use a source and fields, such as \"mail from=alice@example.com\", \
+             \"mail from=@example.com\" (anyone there), \"mail subject~invoice\" (subject contains) or 'file folder=\"Invoices\"'"
         )
     };
     let mut rest = spec.trim();
@@ -47,9 +91,10 @@ pub fn parse(spec: &str) -> Result<Trigger, String> {
     rest = after.trim_start();
     let mut when = Vec::new();
     while !rest.is_empty() {
-        let (k, v) = rest
-            .split_once('=')
-            .ok_or_else(|| bad("a field needs key=value"))?;
+        let at = rest
+            .find(['=', '~'])
+            .ok_or_else(|| bad("a field needs key=value or key~value"))?;
+        let (k, v) = (&rest[..at], &rest[at + 1..]);
         let k = k.to_lowercase();
         if !word(&k) {
             return Err(bad("field names are short lowercase names"));
@@ -62,7 +107,42 @@ pub fn parse(spec: &str) -> Result<Trigger, String> {
         if v.is_empty() || v.len() > FIELD_CAP || v.contains('"') {
             return Err(bad("a field value is empty, too long or holds a quote"));
         }
-        when.push((k, v.to_string()));
+        if !v.chars().any(char::is_alphanumeric) {
+            return Err(bad(
+                "a field value needs a letter or digit, not only wildcards",
+            ));
+        }
+        let op = if rest.as_bytes()[at] == b'~' {
+            if ADDRESS_FIELDS.contains(&k.as_str()) {
+                return Err(bad(&format!(
+                    "\"{k}~\" would match lookalike addresses; use {k}=name@domain or {k}=@domain"
+                )));
+            }
+            if v.len() > CONTAINS_CAP || v.contains('*') {
+                return Err(bad(&format!(
+                    "a ~ value is plain words up to {CONTAINS_CAP} bytes, no wildcards"
+                )));
+            }
+            Op::Has
+        } else if let Some(d) = v.strip_prefix('@') {
+            if !domain(d) {
+                return Err(bad(
+                    "after @ comes a whole domain, such as @example.com, no wildcards",
+                ));
+            }
+            Op::Domain
+        } else if ADDRESS_FIELDS.contains(&k.as_str()) && v.contains('*') {
+            return Err(bad(&format!(
+                "no wildcards: {k}=@example.com is anyone at example.com"
+            )));
+        } else {
+            Op::Is
+        };
+        when.push(Cond {
+            key: k,
+            op,
+            value: v.to_string(),
+        });
         rest = after.trim_start();
     }
     if when.len() > MAX_CONDITIONS {
@@ -74,25 +154,39 @@ pub fn parse(spec: &str) -> Result<Trigger, String> {
 impl std::fmt::Display for Trigger {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(&self.source)?;
-        for (k, v) in &self.when {
+        for c in &self.when {
+            let op = if c.op == Op::Has { '~' } else { '=' };
+            let (k, v) = (&c.key, &c.value);
             if v.contains(' ') {
-                write!(f, " {k}=\"{v}\"")?;
+                write!(f, " {k}{op}\"{v}\"")?;
             } else {
-                write!(f, " {k}={v}")?;
+                write!(f, " {k}{op}{v}")?;
             }
         }
         Ok(())
     }
 }
 
+impl Cond {
+    fn holds(&self, field: &str) -> bool {
+        let field = field.trim();
+        match self.op {
+            Op::Is => field.eq_ignore_ascii_case(&self.value),
+            Op::Domain => {
+                domain_of(field).is_some_and(|d| d.eq_ignore_ascii_case(&self.value[1..]))
+            }
+            Op::Has => field.to_lowercase().contains(&self.value.to_lowercase()),
+        }
+    }
+}
+
 impl Trigger {
     pub fn matches(&self, e: &Event) -> bool {
         e.source == self.source
-            && self.when.iter().all(|(k, v)| {
-                e.fields
-                    .get(k)
-                    .is_some_and(|f| f.trim().eq_ignore_ascii_case(v))
-            })
+            && self
+                .when
+                .iter()
+                .all(|c| e.fields.get(&c.key).is_some_and(|f| c.holds(f)))
     }
 }
 
@@ -211,9 +305,14 @@ pub fn deliver(app: &Arc<App>, user: &str, mut e: Event, at: i64) -> Result<Outc
                 retry_after,
             }),
             Claim::Run => {
-                app.store
-                    .finish_job(job.id, "running", None)
-                    .map_err(|e| e.to_string())?;
+                if app
+                    .store
+                    .start_job(job.id, None)
+                    .map_err(|e| e.to_string())?
+                    == 0
+                {
+                    continue;
+                }
                 out.started.push(job.id);
                 let ctx = Some(e.context());
                 out.runs
@@ -342,6 +441,112 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad} was accepted");
         }
+    }
+
+    fn with(fields: &[(&str, &str)]) -> Event {
+        Event {
+            fields: fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..mail("1", "")
+        }
+    }
+
+    #[test]
+    fn a_domain_matches_its_own_senders_and_no_lookalike() {
+        let t = parse("mail from=@Acme.com").unwrap();
+        assert_eq!(t.when[0].op, Op::Domain);
+        assert_eq!(parse(&t.to_string()).unwrap(), t, "round trip");
+        for ok in ["alice@acme.com", "Bob@ACME.COM", " c@acme.com "] {
+            assert!(t.matches(&mail("1", ok)), "{ok} missed");
+        }
+        for no in [
+            "x@evil-acme.com",
+            "x@acme.com.evil.io",
+            "x@notacme.com",
+            "x@sub.acme.com",
+            "acme.com",
+            "@acme.com",
+            "x@acme.co",
+            "x@acme.com@evil.io",
+            "x@acme.com.",
+            "",
+        ] {
+            assert!(!t.matches(&mail("1", no)), "{no} matched @acme.com");
+        }
+        // an exact address is still exact
+        let exact = parse("mail from=alice@acme.com").unwrap();
+        assert_eq!(exact.when[0].op, Op::Is);
+        assert!(!exact.matches(&mail("1", "bob@acme.com")));
+    }
+
+    #[test]
+    fn a_subject_pattern_matches_inside_ignoring_case() {
+        let t = parse("mail from=@acme.com subject~invoice").unwrap();
+        assert_eq!(t.to_string(), "mail from=@acme.com subject~invoice");
+        let ev = |from, subject| with(&[("from", from), ("subject", subject)]);
+        assert!(t.matches(&ev("a@acme.com", "Your INVOICE for March")));
+        assert!(t.matches(&ev("a@acme.com", "invoice")));
+        assert!(!t.matches(&ev("a@acme.com", "Your receipt")), "no invoice");
+        assert!(
+            !t.matches(&ev("a@evil-acme.com", "Invoice")),
+            "wrong sender"
+        );
+        assert!(!t.matches(&with(&[("from", "a@acme.com")])), "no subject");
+        let q = parse(r#"mail subject~"Due Today""#).unwrap();
+        assert_eq!(q.to_string(), r#"mail subject~"Due Today""#);
+        assert_eq!(parse(&q.to_string()).unwrap(), q, "round trip");
+        assert!(q.matches(&with(&[("subject", "RE: payment due today!")])));
+        // = on a subject stays exact
+        let exact = parse("mail subject=invoice").unwrap();
+        assert!(!exact.matches(&with(&[("subject", "Your invoice")])));
+        assert!(exact.matches(&with(&[("subject", "Invoice")])));
+    }
+
+    #[test]
+    fn broad_or_malformed_patterns_are_refused() {
+        let long = format!("mail subject~{}", "a".repeat(CONTAINS_CAP + 1));
+        let long_domain = format!("mail from=@{}.com", "a".repeat(300));
+        for bad in [
+            "mail from=@",
+            "mail from=@*",
+            "mail from=*",
+            "mail from=*@acme.com",
+            "mail from=@*.acme.com",
+            "mail from=@acme",
+            "mail from=@.com",
+            "mail from=@acme..com",
+            "mail from=@-acme.com",
+            "mail from=@acme.com/x",
+            "mail subject~",
+            "mail subject~*",
+            "mail subject~*invoice*",
+            r#"mail subject~" ""#,
+            "mail subject~...",
+            "mail from~acme.com",
+            "mail to~acme",
+            "mail ~invoice",
+            &long,
+            &long_domain,
+        ] {
+            assert!(parse(bad).is_err(), "{bad} was accepted");
+        }
+        assert!(parse(&format!("mail subject~{}", "a".repeat(CONTAINS_CAP))).is_ok());
+    }
+
+    #[test]
+    fn a_paused_routine_starts_on_no_event() {
+        let app = app();
+        let id = on_mail(&app, "a", "@acme.com");
+        assert_eq!(app.store.set_enabled("a", id, false, None).unwrap(), 1);
+        let o = deliver(&app, "a", mail("1", "boss@acme.com"), 1000).unwrap();
+        assert!(o.started.is_empty() && o.limited.is_empty(), "{o:?}");
+        assert_eq!(
+            app.store.start_job(id, None).unwrap(),
+            0,
+            "a paused routine is never started"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

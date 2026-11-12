@@ -411,6 +411,29 @@ impl Store {
         )
     }
 
+    /// Owner only, through the API: pausing clears the next run; resuming sets the one given, so
+    /// runs missed while paused are never made up. Pending routines are neither.
+    pub fn set_enabled(
+        &self,
+        user: &str,
+        id: i64,
+        enabled: bool,
+        next: Option<i64>,
+    ) -> rusqlite::Result<usize> {
+        self.db.lock().unwrap().execute(
+            "UPDATE jobs SET enabled = ?3, next_run_at = ?4 WHERE id = ?1 AND user = ?2 AND status = 'active'",
+            params![id, user, enabled as i64, next],
+        )
+    }
+
+    /// Marks a run started, only while the routine is active and not paused: 0 means do not run it.
+    pub fn start_job(&self, id: i64, next: Option<i64>) -> rusqlite::Result<usize> {
+        self.db.lock().unwrap().execute(
+            "UPDATE jobs SET last_run_at = ?2, last_status = 'running', next_run_at = ?3 WHERE id = ?1 AND status = 'active' AND enabled = 1",
+            params![id, now(), next],
+        )
+    }
+
     pub fn discard_job(&self, user: &str, id: i64) -> rusqlite::Result<usize> {
         let db = self.db.lock().unwrap();
         let n = db.execute(
