@@ -1074,8 +1074,10 @@ pub(crate) mod tests {
             }
             let (code, b) = run(fridge, "owner");
             assert_eq!(code, 200, "{b}");
+            // the stand-in echoes the last line it was asked: the routine's own task, framed as a run
             assert_eq!(
-                b["run"]["reply"], "**Reminder:** Remind me to check the fridge temperature.",
+                b["run"]["reply"],
+                "**Reminder:** The routine's task: Remind me to check the fridge temperature.",
                 "the routine's own prompt ran: {b}"
             );
             assert!(

@@ -442,13 +442,16 @@ pub fn execute(app: &App, job: &Job, tz: TimeZone, event: Option<&str>, title: &
     ) {
         eprintln!("scheduler: job {}: session: {e}", job.id);
     }
+    // The run is the delivery: asked "remind me to X", the model answered "I can't send a direct
+    // reminder" (QA 2026-11-13). It is told it is the routine reaching the owner, and to give the result.
+    let text = routine_turn(&job.name, &job.prompt);
     let reply = crate::agent::run(
         app,
         bot,
         crate::agent::Input {
             user: &job.user,
             session: &session,
-            text: &job.prompt,
+            text: &text,
             context: event,
             outside: event.is_some(),
             owner: false,
@@ -462,6 +465,16 @@ pub fn execute(app: &App, job: &Job, tz: TimeZone, event: Option<&str>, title: &
     )
     .map(|t| t.reply);
     Ran { session, reply }
+}
+
+/// What a routine run asks: its own task, framed as the routine reaching the owner now.
+pub fn routine_turn(name: &str, prompt: &str) -> String {
+    format!(
+        "This is your routine \"{name}\" running now, as the owner set it up. Your reply is how it \
+         reaches them: reply with its result itself. If the task is to remind them of something, your \
+         reply is that reminder, said directly (for example \"Reminder: ...\"); never say you cannot \
+         send reminders. Do not create, change or delete routines.\n\nThe routine's task: {prompt}"
+    )
 }
 
 /// Runs a routine off the async threads and records how it went; see `execute`.
@@ -487,10 +500,24 @@ pub fn start(
 
 #[cfg(test)]
 mod tests {
-    use super::{due, new_schedule, next_run, zone};
+    use super::{due, new_schedule, next_run, routine_turn, zone};
     use crate::store::{PENDING, Store};
     use jiff::tz::TimeZone;
     const UTC: TimeZone = TimeZone::UTC;
+
+    #[test]
+    fn a_reminder_run_is_told_its_reply_is_the_reminder() {
+        let t = routine_turn("rice", "remind me to count the rice and canned goods stock");
+        assert!(
+            t.contains("your reply is that reminder") || t.contains("reply is that reminder"),
+            "{t}"
+        );
+        assert!(
+            t.ends_with("The routine's task: remind me to count the rice and canned goods stock"),
+            "{t}"
+        );
+        assert!(t.contains("never say you cannot send reminders"), "{t}");
+    }
 
     #[test]
     fn pending_jobs_never_run() {
