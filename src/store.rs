@@ -46,6 +46,32 @@ pub struct Job {
 
 pub const PENDING: &str = "pending";
 
+/// Routines one user may keep, pending ones included.
+pub const MAX_JOBS_PER_USER: i64 = 50;
+/// Routines one bot may hold across all users: user ids are the caller's to choose.
+pub const MAX_JOBS_PER_BOT: i64 = 200;
+
+#[derive(Debug)]
+pub enum JobError {
+    Full(String),
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            JobError::Full(m) => f.write_str(m),
+            JobError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for JobError {
+    fn from(e: rusqlite::Error) -> Self {
+        JobError::Db(e)
+    }
+}
+
 pub const DEFAULT_USER: &str = "owner";
 const USER_COL: &str = "TEXT NOT NULL DEFAULT 'owner'";
 
@@ -251,13 +277,8 @@ impl Store {
         schedule: &str,
         prompt: &str,
         next: Option<i64>,
-    ) -> rusqlite::Result<i64> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![user, bot, name, schedule, prompt, next],
-        )?;
-        Ok(db.last_insert_rowid())
+    ) -> Result<i64, JobError> {
+        self.insert_job(user, bot, name, schedule, prompt, next, None)
     }
 
     /// Saved but not scheduled: no next run until the owner confirms it.
@@ -269,12 +290,39 @@ impl Store {
         schedule: &str,
         prompt: &str,
         origin: &str,
-    ) -> rusqlite::Result<i64> {
+    ) -> Result<i64, JobError> {
+        self.insert_job(user, bot, name, schedule, prompt, None, Some(origin))
+    }
+
+    /// Counts and inserts under one lock, so parallel requests cannot pass the caps together.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_job(
+        &self,
+        user: &str,
+        bot: &str,
+        name: &str,
+        schedule: &str,
+        prompt: &str,
+        next: Option<i64>,
+        origin: Option<&str>,
+    ) -> Result<i64, JobError> {
         let db = self.db.lock().unwrap();
+        let count = |sql: &str, v: &str| db.query_row(sql, params![v], |r| r.get::<_, i64>(0));
+        if count("SELECT COUNT(*) FROM jobs WHERE user = ?1", user)? >= MAX_JOBS_PER_USER {
+            return Err(JobError::Full(format!(
+                "routine limit reached ({MAX_JOBS_PER_USER}, waiting ones included): delete one first"
+            )));
+        }
+        if count("SELECT COUNT(*) FROM jobs WHERE bot = ?1", bot)? >= MAX_JOBS_PER_BOT {
+            return Err(JobError::Full(format!(
+                "this bot holds its limit of {MAX_JOBS_PER_BOT} routines: delete one first"
+            )));
+        }
+        let status = if origin.is_some() { PENDING } else { "active" };
         db.execute(
             "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
-            params![user, bot, name, schedule, prompt, PENDING, origin],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![user, bot, name, schedule, prompt, next, status, origin],
         )?;
         Ok(db.last_insert_rowid())
     }
@@ -405,6 +453,42 @@ mod tests {
         assert_eq!(s.discard_job("b", p).unwrap(), 0);
         assert_eq!(s.discard_job("a", p).unwrap(), 1);
         assert!(s.job("a", p).unwrap().is_none());
+    }
+
+    #[test]
+    fn routines_are_capped_per_user_and_per_bot() {
+        let s = Store::open(Path::new(":memory:")).unwrap();
+        for i in 0..MAX_JOBS_PER_USER - 1 {
+            s.add_job("a", "nexy", &format!("j{i}"), "every 1h", "p", Some(1))
+                .unwrap();
+        }
+        s.add_pending_job("a", "nexy", "last", "every 1h", "p", "read_page")
+            .unwrap();
+        let full = s.add_job("a", "nexy", "x", "every 1h", "p", Some(1));
+        assert!(matches!(full, Err(JobError::Full(_))), "{full:?}");
+        let full = s.add_pending_job("a", "other", "x", "every 1h", "p", "o");
+        assert!(matches!(full, Err(JobError::Full(_))), "pending count too");
+        s.add_job("b", "nexy", "x", "every 1h", "p", Some(1))
+            .unwrap();
+        for u in 0..MAX_JOBS_PER_BOT - MAX_JOBS_PER_USER - 1 {
+            s.add_job(&format!("u{u}"), "nexy", "x", "every 1h", "p", Some(1))
+                .unwrap();
+        }
+        let full = s.add_job("fresh", "nexy", "x", "every 1h", "p", Some(1));
+        assert!(
+            full.as_ref()
+                .is_err_and(|e| e.to_string().contains("this bot")),
+            "{full:?}"
+        );
+        assert!(
+            s.add_job("fresh", "coder", "x", "every 1h", "p", Some(1))
+                .is_ok()
+        );
+        assert_eq!(s.delete_job("a", 1).unwrap(), 1);
+        assert!(
+            s.add_job("a", "coder", "x", "every 1h", "p", Some(1))
+                .is_ok()
+        );
     }
 
     #[test]

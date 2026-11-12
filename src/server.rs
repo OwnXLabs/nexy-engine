@@ -1,7 +1,7 @@
 use crate::App;
 use crate::agent::{self, Input};
-use crate::scheduler::next_run;
-use crate::store::{DEFAULT_USER, PENDING, now};
+use crate::scheduler::new_schedule;
+use crate::store::{DEFAULT_USER, JobError, PENDING, now};
 use axum::extract::{FromRequestParts, OriginalUri, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -36,30 +36,47 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(crate::uhp::router(app.clone()))
         .route("/health", get(health))
         .route("/", get(ui))
+        .fallback(|| async { err(StatusCode::NOT_FOUND, "not found") })
+        .layer(middleware::from_fn_with_state(app.clone(), host_guard))
         .with_state(app)
 }
 
 /// Without a key the engine serves loopback only, so a request naming any other host came through
-/// a web page that rebound its own name to 127.0.0.1.
-fn loopback_host(headers: &HeaderMap) -> bool {
+/// a web page that rebound its own name to 127.0.0.1. Only loopback names on the engine's own port,
+/// and names the operator configured, are answered.
+fn host_allowed(cfg: &crate::config::Config, headers: &HeaderMap) -> bool {
     let Some(h) = headers.get("host").and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    let name = if let Some(rest) = h.strip_prefix('[') {
-        rest.split(']').next().unwrap_or("")
-    } else {
-        h.rsplit_once(':').map_or(h, |(n, _)| n)
+    let h = h.to_ascii_lowercase();
+    let (name, port) = match h.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((n, p)) => (n, p.strip_prefix(':')),
+            None => return false,
+        },
+        None => match h.rsplit_once(':') {
+            Some((n, p)) => (n, Some(p)),
+            None => (h.as_str(), None),
+        },
     };
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "127.0.0.1" | "localhost" | "::1"
-    )
+    if cfg.hosts.iter().any(|c| *c == h || *c == name) {
+        return true;
+    }
+    matches!(name, "127.0.0.1" | "localhost" | "::1") && port == Some(&cfg.port.to_string())
+}
+
+/// Runs before routing: a keyless engine refuses requests for any other host with 421.
+async fn host_guard(State(app): S, req: Request, next: Next) -> Response {
+    if app.cfg.api_key.is_none() && !host_allowed(&app.cfg, req.headers()) {
+        return err(
+            StatusCode::MISDIRECTED_REQUEST,
+            "this engine answers only to its loopback address",
+        );
+    }
+    next.run(req).await
 }
 
 pub fn authorized(app: &App, headers: &HeaderMap) -> bool {
-    if app.cfg.api_key.is_none() {
-        return loopback_host(headers);
-    }
     app.cfg.api_key.as_ref().is_none_or(|key| {
         headers
             .get("authorization")
@@ -457,7 +474,7 @@ async fn create_job(
     if !app.bots.contains_key(&bot) {
         return err(StatusCode::NOT_FOUND, &format!("no bot \"{bot}\""));
     }
-    let next = match next_run(&j.schedule, now()) {
+    let next = match new_schedule(&j.schedule, now()) {
         Ok(n) => n,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
@@ -469,6 +486,7 @@ async fn create_job(
             json!({"job": {"id": id, "name": j.name, "schedule": j.schedule, "next_run_at": next}}),
         )
         .into_response(),
+        Err(JobError::Full(m)) => err(StatusCode::CONFLICT, &m),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -500,7 +518,7 @@ async fn confirm_job(
         Ok(_) => return err(StatusCode::NOT_FOUND, "no pending routine with that id"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let next = match next_run(&job.schedule, now()) {
+    let next = match new_schedule(&job.schedule, now()) {
         Ok(n) => n,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
@@ -561,23 +579,122 @@ mod tests {
             m.insert("host", v.parse().unwrap());
             m
         };
+        let mut cfg = test_app(7300).cfg;
         for ok in [
             "127.0.0.1:7300",
             "localhost:7300",
             "[::1]:7300",
-            "LOCALHOST",
+            "LOCALHOST:7300",
         ] {
-            assert!(super::loopback_host(&h(ok)), "{ok}");
+            assert!(super::host_allowed(&cfg, &h(ok)), "{ok}");
         }
         for bad in [
             "evil.example:7300",
-            "127.0.0.1.evil.example",
+            "127.0.0.1.evil.example:7300",
             "[::2]:7300",
             "nexy.box.lan",
+            "localhost",
+            "127.0.0.1:7301",
+            "[::1",
         ] {
-            assert!(!super::loopback_host(&h(bad)), "{bad}");
+            assert!(!super::host_allowed(&cfg, &h(bad)), "{bad}");
         }
-        assert!(!super::loopback_host(&axum::http::HeaderMap::new()));
+        assert!(!super::host_allowed(&cfg, &axum::http::HeaderMap::new()));
+        cfg.hosts = vec!["nexy.box.lan".into()];
+        assert!(super::host_allowed(&cfg, &h("nexy.box.lan")));
+        assert!(super::host_allowed(&cfg, &h("NEXY.box.lan:443")));
+        assert!(!super::host_allowed(&cfg, &h("other.box.lan")));
+    }
+
+    /// DNS rebinding: a page whose name now points at 127.0.0.1 sends its own name as Host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebound_names_get_421_on_every_route() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let app = std::sync::Arc::new(test_app(port));
+        let srv = tokio::spawn(axum::serve(l, super::router(app)).into_future());
+        let res = tokio::task::spawn_blocking(move || {
+            let call = |m: &str, path: &str, host: &str| -> u16 {
+                let r = ureq::request(m, &format!("http://127.0.0.1:{port}{path}"))
+                    .set("host", host)
+                    .call();
+                match r {
+                    Ok(r) => r.status(),
+                    Err(ureq::Error::Status(c, _)) => c,
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            for (m, path) in [
+                ("GET", "/api/sessions"),
+                ("GET", "/api/jobs"),
+                ("POST", "/v1/chat/completions"),
+                ("GET", "/v1/uhp"),
+                ("GET", "/v1/harnesses"),
+                ("GET", "/p/nexy/api/jobs"),
+                ("GET", "/health"),
+                ("GET", "/"),
+                ("GET", "/no-such-route"),
+            ] {
+                assert_eq!(
+                    call(m, path, &format!("rebind.example:{port}")),
+                    421,
+                    "{m} {path}"
+                );
+            }
+            let me = format!("127.0.0.1:{port}");
+            assert_eq!(call("GET", "/api/sessions", &me), 200);
+            assert_eq!(call("GET", "/health", &format!("localhost:{port}")), 200);
+            assert_eq!(call("GET", "/no-such-route", &me), 404);
+        })
+        .await;
+        srv.abort();
+        res.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_refuses_fast_or_too_many_routines() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut app = test_app(port);
+        app.bots.insert(
+            "nexy".into(),
+            crate::bots::Bot {
+                name: "nexy".into(),
+                persona: String::new(),
+                persona_file: None,
+                tools: Vec::new(),
+                max_steps: 1,
+                max_tokens: 1,
+                max_secs: 1,
+                search_first: false,
+            },
+        );
+        let app = std::sync::Arc::new(app);
+        for i in 0..crate::store::MAX_JOBS_PER_USER - 1 {
+            app.store
+                .add_job("owner", "nexy", &format!("j{i}"), "every 1h", "p", Some(1))
+                .unwrap();
+        }
+        let srv = tokio::spawn(axum::serve(l, super::router(app)).into_future());
+        let res = tokio::task::spawn_blocking(move || {
+            let post = |schedule: &str| -> u16 {
+                let r = ureq::post(&format!("http://127.0.0.1:{port}/api/jobs")).send_json(
+                    serde_json::json!({"name": "n", "schedule": schedule, "prompt": "p"}),
+                );
+                match r {
+                    Ok(r) => r.status(),
+                    Err(ureq::Error::Status(c, _)) => c,
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            assert_eq!(post("every 2m"), 400);
+            assert_eq!(post("* * * * *"), 400);
+            assert_eq!(post("every 5m"), 200);
+            assert_eq!(post("every 1h"), 409);
+        })
+        .await;
+        srv.abort();
+        res.unwrap();
     }
 
     use super::{safe_id, same};
@@ -594,11 +711,11 @@ mod tests {
         assert!(!safe_id(&"x".repeat(129)));
     }
 
-    fn test_app() -> crate::App {
+    fn test_app(port: u16) -> crate::App {
         crate::App {
             cfg: crate::config::Config {
                 host: "127.0.0.1".into(),
-                port: 0,
+                port,
                 model_url: "http://127.0.0.1:9".into(),
                 model: "m".into(),
                 model_key: None,
@@ -608,6 +725,7 @@ mod tests {
                 slots: 1,
                 api_key: None,
                 caps_file: None,
+                hosts: Vec::new(),
             },
             store: crate::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
             backend: crate::model::Backend::new("http://127.0.0.1:9", "m", None),
@@ -621,7 +739,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn owner_confirms_or_discards_a_pending_routine() {
-        let app = std::sync::Arc::new(test_app());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = std::sync::Arc::new(test_app(l.local_addr().unwrap().port()));
         let wait = app
             .store
             .add_pending_job(
@@ -637,7 +756,6 @@ mod tests {
             .store
             .add_pending_job("owner", "nexy", "d", "every 1h", "p", "x")
             .unwrap();
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         let srv = tokio::spawn(axum::serve(l, super::router(app.clone())).into_future());
         let res = tokio::task::spawn_blocking(move || {

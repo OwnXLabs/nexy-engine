@@ -145,6 +145,9 @@ fn main() {
     if args.first().map(String::as_str) == Some("sandbox-exec") && args.len() == 4 {
         std::process::exit(sandbox::exec_confined(&args[1], &args[2], &args[3]));
     }
+    if args.first().map(String::as_str) == Some("sandbox-inner") && args.len() == 5 {
+        std::process::exit(sandbox::inner(&args[1], &args[2], &args[3], &args[4]));
+    }
     if args.first().map(String::as_str) == Some("sandbox-run") && args.len() == 4 {
         let r = sandbox::run(
             std::path::Path::new(&args[1]),

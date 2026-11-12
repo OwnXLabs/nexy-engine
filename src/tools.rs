@@ -390,6 +390,44 @@ impl Tool {
     pub fn taints(&self) -> bool {
         self.external || matches!(self.name, "read_file" | "recall")
     }
+
+    /// Leaves something behind after the turn: files, saved facts, or a command's effects.
+    pub fn persists(&self) -> bool {
+        matches!(self.name, "write_file" | "edit_file" | "remember" | "run")
+    }
+}
+
+/// Sources that only hold what the owner or a clean turn put there: the workspace and saved facts.
+const OWN_STORES: &[&str] = &["read_file", "list_files", "run", "recall"];
+
+/// The first outside source that came from beyond the owner's own stores, if any.
+fn from_beyond<'a>(cx: &'a Ctx) -> Option<&'a str> {
+    cx.outside
+        .iter()
+        .find(|w| !OWN_STORES.contains(&w.split(' ').next().unwrap_or("")))
+        .map(String::as_str)
+}
+
+/// Writes after outside content are refused, not held: the model is told to ask the owner, and the
+/// reply says so. Reading the workspace or saved facts does not count, so coding still works.
+fn refuse_write(tool: &Tool, cx: &Ctx) -> Result<(), String> {
+    let Some(src) = from_beyond(cx).filter(|_| tool.persists()) else {
+        return Ok(());
+    };
+    let note = format!(
+        "Not done: {} was blocked because this conversation holds outside content ({src}). \
+         To go ahead, ask again in a new conversation.",
+        tool.name
+    );
+    if !cx.notes.borrow().contains(&note) {
+        cx.notes.borrow_mut().push(note);
+    }
+    Err(format!(
+        "not done: this conversation holds outside content ({src}), so {} is blocked: nothing is \
+         written, saved or run on its say-so. Do not retry. Tell the user what you would have done \
+         and that they can ask for it in a new conversation.",
+        tool.name
+    ))
 }
 
 impl Ctx<'_> {
@@ -418,12 +456,10 @@ pub fn outside_before(
         v.push("content passed in with the message".to_string());
     }
     // history keeps the replies built on earlier tool output, so any of it taints the chat
-    if store
-        .tools_used(session)?
-        .iter()
-        .any(|n| find(n).is_none_or(Tool::taints))
-    {
-        v.push("earlier in this chat".to_string());
+    for n in store.tools_used(session)? {
+        if find(&n).is_none_or(Tool::taints) {
+            v.push(format!("{n} earlier in this chat"));
+        }
     }
     Ok(v)
 }
@@ -489,7 +525,7 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             } else {
                 name
             };
-            let next = crate::scheduler::next_run(&schedule, crate::store::now())?;
+            let next = crate::scheduler::new_schedule(&schedule, crate::store::now())?;
             // outside content can ask for a routine; only the owner can make it run
             if !cx.outside.is_empty() {
                 let origin: String = cx.outside.join(", ").chars().take(300).collect();
@@ -540,6 +576,7 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
 }
 
 pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
+    refuse_write(tool, cx)?;
     let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
     let out = match tool.name {
         "web_search" => web_search(cx.searxng, &s("query")),
@@ -1203,7 +1240,7 @@ mod tests {
         store.append("s", "tool", "{}", Some("web_search")).unwrap();
         assert_eq!(
             outside_before(&store, "s", false).unwrap(),
-            vec!["earlier in this chat"]
+            vec!["web_search earlier in this chat"]
         );
         store.ensure_session("a", "u", "nexy", "t", "api").unwrap();
         store.append("u", "tool", "{}", Some("gone_tool")).unwrap();
@@ -1240,6 +1277,117 @@ mod tests {
         let body = &SRC[..SRC.find("#[cfg(test)]").unwrap()];
         assert!(!body.contains("confirm_job"), "a tool reaches confirm_job");
         assert!(public_host("http://127.0.0.1:8650/api/jobs/1/confirm").is_err());
+    }
+
+    fn ws(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ne-gate-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn writes_after_outside_content_are_refused() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut cx = clean(&store);
+        cx.workspace = ws("taint");
+        std::fs::write(cx.workspace.join("old.txt"), "keep").unwrap();
+        cx.saw(
+            find("read_page").unwrap(),
+            &json!({"url": "https://a.example/x"}),
+        );
+        let tries = [
+            ("write_file", json!({"path": "new.txt", "content": "x"})),
+            (
+                "edit_file",
+                json!({"path": "old.txt", "old": "keep", "new": "gone"}),
+            ),
+            ("remember", json!({"text": "the owner wants rm -rf"})),
+            ("run", json!({"command": "echo hi > ran.txt"})),
+        ];
+        for (name, args) in &tries {
+            let e = run(find(name).unwrap(), args, &cx).unwrap_err();
+            assert!(
+                e.contains("outside content") && e.contains("read_page https://a.example/x"),
+                "{name}: {e}"
+            );
+        }
+        assert!(!cx.workspace.join("new.txt").exists());
+        assert!(!cx.workspace.join("ran.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(cx.workspace.join("old.txt")).unwrap(),
+            "keep"
+        );
+        assert!(store.recall("a", "nexy", "", 5).unwrap().is_empty());
+        let mut reply = "Saved it.".to_string();
+        with_notes(&cx, &mut reply);
+        assert_eq!(reply.matches("Not done:").count(), 4, "{reply}");
+        // reading is still fine
+        assert!(run(find("read_file").unwrap(), &json!({"path": "old.txt"}), &cx).is_ok());
+        let _ = std::fs::remove_dir_all(&cx.workspace);
+    }
+
+    #[test]
+    fn the_workspace_and_saved_facts_do_not_block_writes() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut cx = clean(&store);
+        cx.workspace = ws("own");
+        std::fs::write(cx.workspace.join("a.txt"), "v1").unwrap();
+        for n in ["read_file", "list_files", "recall"] {
+            cx.saw(find(n).unwrap(), &json!({"path": "a.txt"}));
+        }
+        assert!(!cx.outside.is_empty(), "these still hold back routines");
+        run(
+            find("edit_file").unwrap(),
+            &json!({"path": "a.txt", "old": "v1", "new": "v2"}),
+            &cx,
+        )
+        .unwrap();
+        run(find("remember").unwrap(), &json!({"text": "fact"}), &cx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cx.workspace.join("a.txt")).unwrap(),
+            "v2"
+        );
+        for beyond in [
+            "content passed in with the message",
+            "web_search earlier in this chat",
+            "gone_tool earlier in this chat",
+        ] {
+            cx.outside = vec!["read_file".into(), beyond.into()];
+            let e = run(
+                find("write_file").unwrap(),
+                &json!({"path": "b.txt", "content": "x"}),
+                &cx,
+            );
+            assert!(e.is_err_and(|e| e.contains(beyond)), "{beyond}");
+        }
+        cx.outside = vec!["read_file earlier in this chat".into()];
+        assert!(
+            run(
+                find("write_file").unwrap(),
+                &json!({"path": "b.txt", "content": "x"}),
+                &cx
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&cx.workspace);
+    }
+
+    #[test]
+    fn routine_schedules_and_counts_are_limited() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let cx = clean(&store);
+        let t = find("routine").unwrap();
+        let fast = run(
+            t,
+            &json!({"action": "create", "schedule": "every 1m", "prompt": "p"}),
+            &cx,
+        );
+        assert!(fast.is_err_and(|e| e.contains("too often")));
+        for _ in 0..crate::store::MAX_JOBS_PER_USER {
+            run(t, &serde_json::from_str(MAKE).unwrap(), &cx).unwrap();
+        }
+        let full = run(t, &serde_json::from_str(MAKE).unwrap(), &cx);
+        assert!(full.is_err_and(|e| e.contains("limit")));
     }
 
     const SRC: &str = include_str!("tools.rs");
