@@ -31,7 +31,9 @@ The goal is simple: keep the engine efficient, so the model gets the machine's m
   when it finishes or times out, including ones that called `setsid` or forked twice: on Linux it
   is a subreaper outside the sandbox; on macOS it runs inside the command's sandbox, which lets it
   signal only that sandbox's processes. At most 4 commands run at once, and each may add at most
-  256 processes (threads on Linux) to what its user already runs.
+  256 processes (threads on Linux) to what its user already runs. The system counts that limit per
+  user, not per command, so one command that hits it can make another running command fail to
+  start processes until it ends.
 
 ## Benchmark (v0.0.1, November 2026)
 

@@ -4,7 +4,20 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
+
+/// RLIMIT_NPROC counts every process of the user, so the fork bomb uses up the allowance of any
+/// command running beside it. Commands share this lock; the bomb holds it alone.
+static PROCS: RwLock<()> = RwLock::new(());
+
+fn shared() -> RwLockReadGuard<'static, ()> {
+    PROCS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn alone() -> RwLockWriteGuard<'static, ()> {
+    PROCS.write().unwrap_or_else(|e| e.into_inner())
+}
 
 struct Dirs {
     base: PathBuf,
@@ -65,6 +78,7 @@ fn unavailable(text: &str) -> bool {
 
 #[test]
 fn writes_inside_the_workspace() {
+    let _g = shared();
     let d = dirs("in");
     let (code, text) = confined(&d, "echo nexy-$((6*7)) > made.txt && cat made.txt");
     if unavailable(&text) {
@@ -83,6 +97,7 @@ fn writes_inside_the_workspace() {
 
 #[test]
 fn cannot_write_or_read_outside() {
+    let _g = shared();
     let d = dirs("out");
     let secret = d.base.join("outside/secret.txt");
     std::fs::write(&secret, "hidden").unwrap();
@@ -118,6 +133,7 @@ fn connects(listener: &TcpListener) -> bool {
 
 #[test]
 fn no_network() {
+    let _g = shared();
     let curl = ["/usr/bin/curl", "/bin/curl"]
         .into_iter()
         .find(|p| Path::new(p).exists());
@@ -155,6 +171,7 @@ fn no_network() {
 
 #[test]
 fn nothing_outlives_the_command() {
+    let _g = shared();
     let d = dirs("bg");
     let marker = d.ws.join("late.txt");
     let cmd = format!("(sleep 3; echo late > {}) & echo started", marker.display());
@@ -218,6 +235,7 @@ fn survivors(marker: &str) -> String {
 /// A new session and a double fork leave the process group; they must still end with the call.
 #[test]
 fn a_new_session_does_not_outlive_the_command() {
+    let _g = shared();
     let d = dirs("sid");
     let marker = format!("sleep 30{}", std::process::id());
     let escape = if Path::new("/usr/bin/setsid").exists() || Path::new("/bin/setsid").exists() {
@@ -246,6 +264,7 @@ fn a_new_session_does_not_outlive_the_command() {
 /// A bounded fork bomb (up to 2,047 processes) hits the per-command process limit and is cleaned up.
 #[test]
 fn a_fork_bomb_stops_at_the_process_limit() {
+    let _g = alone();
     let d = dirs("bomb");
     let marker = format!("sleep 4.{}", std::process::id());
     let bomb = format!(
