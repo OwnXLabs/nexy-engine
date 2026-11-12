@@ -1,5 +1,5 @@
 use crate::model::RawCall;
-use crate::store::{PENDING, Store};
+use crate::store::{Job, PENDING, Store};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -543,6 +543,9 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             } else {
                 name
             };
+            if let Some(j) = just_made(cx, &name, &prompt)? {
+                return Err(already_made(cx, &j));
+            }
             if !trigger.is_empty() {
                 return trigger_routine(cx, &name, &trigger, &prompt);
             }
@@ -595,6 +598,97 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             "unknown action \"{other}\": use create, list or delete"
         )),
     }
+}
+
+/// A routine for the same thing made this recently is the same request made twice: Nexy set it from
+/// the owner's words, then the turn that ran it once made it again at a time of its own (QA 0.2.8).
+pub const SAME_ROUTINE_SECS: i64 = 300;
+
+/// The words that say what a routine does, without filler such as "remind me to" or "the user".
+fn gist(text: &str) -> std::collections::HashSet<String> {
+    const FILLER: &[&str] = &[
+        "a", "an", "the", "and", "or", "of", "to", "for", "in", "on", "at", "me", "my", "i", "you",
+        "your", "user", "user's", "please", "remind", "reminder", "send", "give", "tell", "it",
+        "this", "that", "every", "each", "daily", "day", "weekday", "weekdays",
+    ];
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty() && !FILLER.contains(w))
+        .map(String::from)
+        .collect()
+}
+
+/// A routine of this user, made in the last SAME_ROUTINE_SECS, that does the same thing.
+fn just_made(cx: &Ctx, name: &str, prompt: &str) -> Result<Option<Job>, String> {
+    let new = gist(&format!("{name} {prompt}"));
+    let since = crate::store::now() - SAME_ROUTINE_SECS;
+    let recent = cx
+        .store
+        .jobs_made_since(cx.user, since)
+        .map_err(|e| e.to_string())?;
+    Ok(recent.into_iter().rev().find(|j| {
+        let old = gist(&format!("{} {}", j.name, j.prompt));
+        let small = new.len().min(old.len());
+        // most of the shorter one's words are in the other: "count stock" and "remind me to
+        // count the rice and canned goods stock" are one routine
+        new == old || (small >= 2 && new.intersection(&old).count() * 5 >= small * 4)
+    }))
+}
+
+/// "30 7 * * 1-5" as "every weekday at 07:30"; a schedule it cannot read is given as it is.
+fn when_text(schedule: &str) -> String {
+    const DAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    if let Some(at) = schedule.strip_prefix("daily ") {
+        return format!("every day at {at}");
+    }
+    let f: Vec<&str> = schedule.split_whitespace().collect();
+    let (Some(m), Some(h)) = (
+        f.first().and_then(|v| v.parse::<u32>().ok()),
+        f.get(1).and_then(|v| v.parse::<u32>().ok()),
+    ) else {
+        return schedule.to_string();
+    };
+    if f.len() != 5 || f[2] != "*" || f[3] != "*" || m > 59 || h > 23 {
+        return schedule.to_string();
+    }
+    let at = format!("{h:02}:{m:02}");
+    match f[4] {
+        "*" => format!("every day at {at}"),
+        "1-5" => format!("every weekday at {at}"),
+        d => match d.parse::<usize>().ok().and_then(|n| DAYS.get(n % 7)) {
+            Some(day) => format!("every {day} at {at}"),
+            None => schedule.to_string(),
+        },
+    }
+}
+
+/// Nothing new is made: the model is told the routine that stands, and the reply carries it.
+fn already_made(cx: &Ctx, j: &Job) -> String {
+    let when = match &j.trigger {
+        Some(t) => format!("when {t} arrives"),
+        None => format!("{} ({})", when_text(&j.schedule), j.tz),
+    };
+    let note = format!(
+        "This routine is already set: \"{}\", {when}. No second one was made.",
+        j.name
+    );
+    if !cx.notes.borrow().contains(&note) {
+        cx.notes.borrow_mut().push(note);
+    }
+    format!(
+        "not created: routine {} \"{}\" for the same thing was made moments ago and runs {when}. \
+         Do not create another or change it. Tell the user it is set to run {when}, and do now \
+         only what they asked to be done now.",
+        j.id, j.name
+    )
 }
 
 /// A trigger lets someone else's mail or files start a run, so one made in chat always waits for
@@ -1450,11 +1544,103 @@ mod tests {
             &cx,
         );
         assert!(fast.is_err_and(|e| e.contains("too often")));
-        for _ in 0..crate::store::MAX_JOBS_PER_USER {
-            run(t, &serde_json::from_str(MAKE).unwrap(), &cx).unwrap();
+        // different routines: the same one twice in a row is refused before any limit
+        for i in 0..crate::store::MAX_JOBS_PER_USER {
+            let args = json!({"action": "create", "schedule": "every 1h", "prompt": format!("Brief me on topic {i}.")});
+            run(t, &args, &cx).unwrap();
         }
         let full = run(t, &serde_json::from_str(MAKE).unwrap(), &cx);
         assert!(full.is_err_and(|e| e.contains("limit")));
+    }
+
+    /// QA 0.2.8: "Every weekday at 7:30 am, remind me to count the rice and canned goods stock."
+    /// Nexy set it from those words; the turn that ran it once made a second at "daily 08:00".
+    #[test]
+    fn one_request_makes_one_routine() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut cx = clean(&store);
+        cx.tz = crate::scheduler::zone("Asia/Manila").unwrap();
+        let t = find("routine").unwrap();
+        // what Nexy made through the API from the owner's words
+        store
+            .add_job(
+                "a",
+                "nexy",
+                "count the rice and canned goods stock.",
+                "30 7 * * 1-5",
+                "Asia/Manila",
+                "remind me to count the rice and canned goods stock.",
+                Some(1),
+            )
+            .unwrap();
+        for (name, prompt) in [
+            (
+                "count stock",
+                "Remind the user to count the rice and canned goods stock.",
+            ),
+            ("Stock count", "Count stock"),
+            ("", "remind me to count the rice and canned goods stock."),
+        ] {
+            let args = json!({"action": "create", "name": name, "schedule": "daily 08:00", "prompt": prompt});
+            let out = run(t, &args, &cx).unwrap_err();
+            assert!(
+                out.starts_with("not created: routine 1")
+                    && out.contains("every weekday at 07:30 (Asia/Manila)"),
+                "{out}"
+            );
+        }
+        assert_eq!(
+            store.jobs(Some("a")).unwrap().len(),
+            1,
+            "a second routine was made"
+        );
+        // the reply says the schedule that stands, once, whatever the model wrote
+        let mut reply = "I've set up a daily routine at 8:00 AM.".to_string();
+        with_notes(&cx, &mut reply);
+        assert!(
+            reply.ends_with(
+                "This routine is already set: \"count the rice and canned goods stock.\", \
+                 every weekday at 07:30 (Asia/Manila). No second one was made."
+            ),
+            "{reply}"
+        );
+        assert_eq!(reply.matches("already set").count(), 1, "{reply}");
+        // something else is a routine of its own, and another user's are not looked at
+        for (user, prompt) in [
+            ("a", "Check the weather in Manila."),
+            ("a", "Check the news in Manila."),
+            ("b", "Remind me to count the rice and canned goods stock."),
+        ] {
+            cx.user = user;
+            let args = json!({"action": "create", "schedule": "daily 08:00", "prompt": prompt});
+            let out = run(t, &args, &cx).unwrap();
+            assert!(out.starts_with("created routine"), "{prompt}: {out}");
+        }
+        // an event routine for the same thing made twice is one too
+        cx.user = "a";
+        let mail = json!({"action": "create", "trigger": "mail from=boss@example.com", "prompt": "Summarise the invoice."});
+        run(t, &mail, &cx).unwrap();
+        let again = run(t, &mail, &cx).unwrap_err();
+        assert!(
+            again.contains("when mail from=boss@example.com arrives"),
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn schedules_read_as_words() {
+        for (s, w) in [
+            ("30 7 * * 1-5", "every weekday at 07:30"),
+            ("0 9 * * *", "every day at 09:00"),
+            ("5 18 * * 1", "every Monday at 18:05"),
+            ("0 8 * * 0", "every Sunday at 08:00"),
+            ("daily 08:00", "every day at 08:00"),
+            ("every 2h", "every 2h"),
+            ("0 9 1 * *", "0 9 1 * *"),
+            ("30 7 * * 1,3", "30 7 * * 1,3"),
+        ] {
+            assert_eq!(when_text(s), w, "{s}");
+        }
     }
 
     const SRC: &str = include_str!("tools.rs");

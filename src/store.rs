@@ -145,6 +145,8 @@ impl Store {
             ("jobs", "origin", "TEXT"),
             ("jobs", "tz", "TEXT NOT NULL DEFAULT 'UTC'"),
             ("jobs", "trigger", "TEXT"),
+            // when it was made; NULL for jobs made before this column
+            ("jobs", "created_at", "INTEGER"),
         ] {
             let has: bool = db
                 .prepare(&format!(
@@ -369,11 +371,26 @@ impl Store {
         }
         let status = if origin.is_some() { PENDING } else { "active" };
         db.execute(
-            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin, tz, trigger)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![user, bot, name, schedule, prompt, next, status, origin, tz, trigger],
+            "INSERT INTO jobs(user, bot, name, schedule, prompt, next_run_at, status, origin, tz, trigger, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![user, bot, name, schedule, prompt, next, status, origin, tz, trigger, now()],
         )?;
         Ok(db.last_insert_rowid())
+    }
+
+    /// This user's jobs made at or after `since` (unix seconds), oldest first.
+    pub fn jobs_made_since(&self, user: &str, since: i64) -> rusqlite::Result<Vec<Job>> {
+        let ids: Vec<i64> = {
+            let db = self.db.lock().unwrap();
+            let mut st = db.prepare("SELECT id FROM jobs WHERE user = ?1 AND created_at >= ?2")?;
+            st.query_map(params![user, since], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        Ok(self
+            .jobs(Some(user))?
+            .into_iter()
+            .filter(|j| ids.contains(&j.id))
+            .collect())
     }
 
     pub fn job(&self, user: &str, id: i64) -> rusqlite::Result<Option<Job>> {
