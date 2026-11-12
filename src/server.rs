@@ -364,7 +364,7 @@ fn outcome(res: Result<Result<agent::Turn, String>, String>) -> (String, &'stati
     match res {
         Ok(Ok(t)) => (
             t.reply.clone(),
-            "stop",
+            if t.cut { "length" } else { "stop" },
             json!({"steps": t.steps, "tools": t.tools, "mode": t.mode,
             "usage": {"prompt_tokens": t.prompt_tokens, "completion_tokens": t.completion_tokens}}),
         ),
@@ -821,6 +821,113 @@ mod tests {
         let jobs = app.store.jobs(Some("owner")).unwrap();
         let tz: Vec<&str> = jobs.iter().map(|j| j.tz.as_str()).collect();
         assert_eq!(tz, ["Asia/Manila", "Asia/Manila", "UTC"]);
+    }
+
+    /// A stand-in model server: OpenAI style at /v1/chat/completions, Ollama style at /api/chat.
+    /// It stops at its token limit when the question asks for "long", else at the end.
+    async fn stand_in_model() -> String {
+        use axum::routing::post;
+        fn cut(b: &serde_json::Value) -> bool {
+            b["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .and_then(|m| m["content"].as_str())
+                .is_some_and(|c| c.contains("long"))
+        }
+        async fn openai(axum::Json(b): axum::Json<serde_json::Value>) -> String {
+            let finish = if cut(&b) { "length" } else { "stop" };
+            if b["stream"] == true {
+                let c = |delta: serde_json::Value, f: serde_json::Value| serde_json::json!({"choices": [{"index": 0, "delta": delta, "finish_reason": f}]});
+                format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    c(
+                        serde_json::json!({"content": "Half an ans"}),
+                        serde_json::Value::Null
+                    ),
+                    c(serde_json::json!({}), finish.into())
+                )
+            } else {
+                serde_json::json!({"choices": [{"index": 0, "finish_reason": finish,
+                    "message": {"role": "assistant", "content": "Half an ans"}}]})
+                .to_string()
+            }
+        }
+        async fn ollama(axum::Json(b): axum::Json<serde_json::Value>) -> String {
+            let finish = if cut(&b) { "length" } else { "stop" };
+            let msg = serde_json::json!({"role": "assistant", "content": "Half an ans"});
+            let last = serde_json::json!({"message": {"role": "assistant", "content": ""},
+                "done": true, "done_reason": finish, "eval_count": 7});
+            if b["stream"] == true {
+                format!(
+                    "{}\n{last}\n",
+                    serde_json::json!({"message": msg, "done": false})
+                )
+            } else {
+                let mut one = last;
+                one["message"] = msg;
+                one.to_string()
+            }
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let r = axum::Router::new()
+            .route("/v1/chat/completions", post(openai))
+            .route("/api/chat", post(ollama));
+        tokio::spawn(axum::serve(l, r).into_future());
+        url
+    }
+
+    /// The model's own finish reason reaches the client: "length" when cut, "stop" when done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cut_answer_finishes_with_length() {
+        let model = stand_in_model().await;
+        for ollama in [false, true] {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let mut app = with_bot(test_app(port));
+            if let Some(bot) = app.bots.get_mut("nexy") {
+                bot.max_secs = 60;
+            }
+            app.cfg.data_dir =
+                std::env::temp_dir().join(format!("nexy-cut-{}", std::process::id()));
+            app.backend = crate::model::Backend::new(&model, "m", None);
+            *app.backend.caps.write().unwrap() = crate::model::Caps {
+                ollama,
+                probed_at: 1,
+                ..Default::default()
+            };
+            let srv =
+                tokio::spawn(axum::serve(l, super::router(std::sync::Arc::new(app))).into_future());
+            let res = tokio::task::spawn_blocking(move || {
+                let ask = |q: &str, stream: bool| -> String {
+                    let r = ureq::post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                        .send_json(serde_json::json!({"messages": [{"role": "user", "content": q}], "stream": stream}))
+                        .unwrap_or_else(|e| panic!("{e}"));
+                    let body = r.into_string().unwrap();
+                    if !stream {
+                        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        assert_eq!(v["choices"][0]["message"]["content"], "Half an ans", "{v}");
+                        return v["choices"][0]["finish_reason"].as_str().unwrap_or("").into();
+                    }
+                    let last = body
+                        .lines()
+                        .filter_map(|l| l.strip_prefix("data: "))
+                        .filter(|d| *d != "[DONE]")
+                        .last()
+                        .map(|d| serde_json::from_str::<serde_json::Value>(d).unwrap())
+                        .unwrap();
+                    last["choices"][0]["finish_reason"].as_str().unwrap_or("").into()
+                };
+                for stream in [false, true] {
+                    let style = if ollama { "ollama" } else { "openai" };
+                    assert_eq!(ask("tell me something long", stream), "length", "{style} stream={stream}");
+                    assert_eq!(ask("tell me something short", stream), "stop", "{style} stream={stream}");
+                }
+            })
+            .await;
+            srv.abort();
+            res.unwrap();
+        }
     }
 
     fn test_app(port: u16) -> crate::App {

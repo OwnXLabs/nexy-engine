@@ -27,6 +27,8 @@ pub struct Turn {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub mode: String,
+    /// the final answer hit the token limit
+    pub cut: bool,
 }
 
 pub type Progress<'a> = dyn Fn(&RawCall, &str) + Sync + 'a;
@@ -317,6 +319,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                     .map_err(db)?;
                 stream.answer(&text);
                 r.turn.reply = text;
+                r.turn.cut = reply.cut;
                 return Ok(r.turn);
             }
             Ok(Step::Calls(calls)) => {
@@ -382,15 +385,10 @@ fn compact(msgs: &mut [Value], budget: usize) {
 }
 
 fn title(text: &str) -> String {
-    let t: String = text
-        .split_whitespace()
-        .take(8)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if t.is_empty() {
-        "Chat".into()
-    } else {
-        t.chars().take(80).collect()
+    let words: Vec<&str> = text.split_whitespace().take(8).collect();
+    match words.join(" ") {
+        t if t.is_empty() => "Chat".into(),
+        t => t.chars().take(80).collect(),
     }
 }
 
