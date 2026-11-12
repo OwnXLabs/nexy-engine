@@ -463,6 +463,7 @@ mod tests {
     fn a_chat_made_trigger_waits_for_the_owner() {
         let app = app();
         let cx = crate::tools::Ctx {
+            used: Default::default(),
             user: "a",
             bot: "nexy",
             store: &app.store,

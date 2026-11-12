@@ -390,6 +390,8 @@ pub struct Ctx<'a> {
     pub notes: RefCell<Vec<String>>,
     /// the owner's zone: routine clock times are read and shown in it
     pub tz: jiff::tz::TimeZone,
+    /// tools that reach the internet, run so far this answer (see `over_limit`)
+    pub used: RefCell<Vec<&'static str>>,
 }
 
 impl Tool {
@@ -714,6 +716,11 @@ fn trigger_routine(cx: &Ctx, name: &str, trigger: &str, prompt: &str) -> Result<
 
 pub fn run(tool: &Tool, args: &Value, cx: &Ctx) -> Result<String, String> {
     refuse_write(tool, cx)?;
+    let done = cx.used.borrow().iter().filter(|n| **n == tool.name).count();
+    if let Some(over) = over_limit(tool.name, done) {
+        return Ok(over);
+    }
+    cx.used.borrow_mut().push(tool.name);
     let s = |k: &str| args[k].as_str().unwrap_or("").to_string();
     let out = match tool.name {
         "web_search" => web_search(cx.searxng, &s("query")),
@@ -878,6 +885,22 @@ fn public_agent() -> ureq::Agent {
         .redirects(0)
         .resolver(PublicOnly)
         .build()
+}
+
+/// How many times a tool that reaches the internet may run in one answer. A model can ask for
+/// many searches in a step and keep asking: one "Continue" ran 34 in 143 s (QA 2026-11-12),
+/// enough to get the owner's address throttled. Past the limit nothing leaves the machine.
+pub const MAX_SEARCHES: usize = 3;
+pub const MAX_PAGES: usize = 5;
+
+/// The reply to a call past its limit, given how many of that tool already ran this answer.
+pub fn over_limit(tool: &str, done: usize) -> Option<String> {
+    let max = match tool {
+        "web_search" => MAX_SEARCHES,
+        "read_page" => MAX_PAGES,
+        _ => return None,
+    };
+    (done >= max).then(|| format!("error: {tool} is limited to {max} per answer and that many have run. Answer now with what you found; do not call it again."))
 }
 
 fn web_search(base: Option<&str>, q: &str) -> Result<String, String> {
@@ -1065,6 +1088,98 @@ pub fn html_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::tests::{test_app, with_bot};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEARCHES: AtomicUsize = AtomicUsize::new(0);
+
+    /// A stand-in model that asks for five searches at every step, and a search server that counts.
+    async fn greedy() -> (String, String) {
+        async fn chat(axum::Json(b): axum::Json<serde_json::Value>) -> String {
+            let n = b["messages"].as_array().map_or(0, |m| m.len());
+            let calls: Vec<_> = (0..5)
+                .map(|i| json!({"id": format!("c{n}{i}"), "type": "function",
+                    "function": {"name": "web_search", "arguments": format!("{{\"query\":\"rice prices manila {n} {i}\"}}")}}))
+                .collect();
+            let msg = if b["tools"].as_array().is_some_and(|t| !t.is_empty()) {
+                json!({"role": "assistant", "content": "", "tool_calls": calls})
+            } else {
+                json!({"role": "assistant", "content": "Here is what I found."})
+            };
+            json!({"choices": [{"index": 0, "finish_reason": "stop", "message": msg}]}).to_string()
+        }
+        async fn search() -> String {
+            SEARCHES.fetch_add(1, Ordering::SeqCst);
+            json!({"results": [{"title": "Rice", "url": "https://example.com/rice", "content": "52 a kilo"}]}).to_string()
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(
+            axum::serve(
+                l,
+                axum::Router::new().route("/v1/chat/completions", axum::routing::post(chat)),
+            )
+            .into_future(),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let searx = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(
+            axum::serve(
+                l,
+                axum::Router::new().route("/search", axum::routing::get(search)),
+            )
+            .into_future(),
+        );
+        (model, searx)
+    }
+
+    /// However often the model asks, one answer makes at most MAX_SEARCHES searches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_answer_searches_at_most_three_times() {
+        let (model, searx) = greedy().await;
+        let mut app = with_bot(test_app(9));
+        let bot = app.bots.get_mut("nexy").unwrap();
+        bot.tools = vec!["web_search".into()];
+        (bot.max_steps, bot.max_tokens, bot.max_secs) = (6, 64, 60);
+        app.cfg.searxng_url = Some(searx);
+        app.backend = crate::model::Backend::new(&model, "m", None);
+        *app.backend.caps.write().unwrap() = crate::model::Caps {
+            mode: crate::model::Mode::Native,
+            native_tools: true,
+            probed_at: 1,
+            ..Default::default()
+        };
+        let turn = tokio::task::spawn_blocking(move || {
+            let bot = app.bots.get("nexy").unwrap().clone();
+            crate::agent::run(
+                &app,
+                &bot,
+                crate::agent::Input {
+                    user: "a",
+                    session: "s-search",
+                    text: "Continue from where you stopped.",
+                    context: None,
+                    outside: false,
+                    owner: true,
+                    research: Some(true),
+                    tz: jiff::tz::TimeZone::UTC,
+                    workspace: None,
+                    cancel: None,
+                    progress: None,
+                    on_text: None,
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            SEARCHES.load(Ordering::SeqCst),
+            MAX_SEARCHES,
+            "searches that left the machine"
+        );
+        assert_eq!(turn.reply, "Here is what I found.");
+    }
 
     #[test]
     fn blocks_private_and_loopback() {
@@ -1229,6 +1344,7 @@ mod tests {
     fn routines_are_a_tool() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let cx = |user, owner| Ctx {
+            used: Default::default(),
             user,
             bot: "nexy",
             store: &store,
@@ -1307,6 +1423,7 @@ mod tests {
 
     fn clean<'a>(store: &'a Store) -> Ctx<'a> {
         Ctx {
+            used: Default::default(),
             user: "a",
             bot: "nexy",
             store,
