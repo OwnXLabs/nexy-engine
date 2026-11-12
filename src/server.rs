@@ -1,6 +1,6 @@
 use crate::App;
 use crate::agent::{self, Input};
-use crate::scheduler::new_schedule;
+use crate::scheduler::{new_schedule, zone, zone_name};
 use crate::store::{DEFAULT_USER, JobError, PENDING, now};
 use axum::extract::{FromRequestParts, OriginalUri, Path, Query, Request, State};
 use axum::http::request::Parts;
@@ -202,6 +202,9 @@ struct ChatBody {
     /// the caller vouches that its system message holds no outside content
     #[serde(default)]
     context_clean: bool,
+    /// the owner's zone, e.g. "Asia/Manila": clock times in new routines are read in it
+    #[serde(default)]
+    tz: Option<String>,
 }
 
 async fn chat(
@@ -261,6 +264,10 @@ async fn chat(
         return err(StatusCode::NOT_FOUND, "no such session");
     }
 
+    let tz = match zone(body.tz.as_deref().unwrap_or("")) {
+        Ok(z) => z,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+    };
     let outside = context.as_deref().is_some_and(|c| !c.trim().is_empty()) && !body.context_clean;
     let a = app.clone();
     let s2 = session.clone();
@@ -282,6 +289,7 @@ async fn chat(
                 outside,
                 owner: true,
                 research,
+                tz: tz.clone(),
                 workspace: None,
                 cancel,
                 progress,
@@ -462,6 +470,9 @@ struct NewJob {
     name: String,
     schedule: String,
     prompt: String,
+    /// the owner's zone; clock times in the schedule are read in it. UTC when absent.
+    #[serde(default)]
+    tz: Option<String>,
 }
 
 async fn create_job(
@@ -474,16 +485,21 @@ async fn create_job(
     if !app.bots.contains_key(&bot) {
         return err(StatusCode::NOT_FOUND, &format!("no bot \"{bot}\""));
     }
-    let next = match new_schedule(&j.schedule, now()) {
+    let tz = match zone(j.tz.as_deref().unwrap_or("")) {
+        Ok(z) => z,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+    };
+    let next = match new_schedule(&j.schedule, &tz, now()) {
         Ok(n) => n,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
+    let name = zone_name(&tz);
     match app
         .store
-        .add_job(&user, &bot, &j.name, &j.schedule, &j.prompt, Some(next))
+        .add_job(&user, &bot, &j.name, &j.schedule, name, &j.prompt, Some(next))
     {
         Ok(id) => Json(
-            json!({"job": {"id": id, "name": j.name, "schedule": j.schedule, "next_run_at": next}}),
+            json!({"job": {"id": id, "name": j.name, "schedule": j.schedule, "tz": name, "next_run_at": next}}),
         )
         .into_response(),
         Err(JobError::Full(m)) => err(StatusCode::CONFLICT, &m),
@@ -506,26 +522,50 @@ fn job_id(p: &HashMap<String, String>) -> i64 {
     p.get("id").and_then(|v| v.parse().ok()).unwrap_or(-1)
 }
 
+#[derive(Deserialize, Default)]
+struct Confirm {
+    /// the confirming owner's zone; the job's own zone when absent
+    #[serde(default)]
+    tz: Option<String>,
+}
+
 /// The owner's yes to a pending routine. Only this API reaches it, never a tool.
+/// The body is optional: an empty one keeps the zone the routine was made in.
 async fn confirm_job(
     State(app): S,
     User(user): User,
     Path(p): Path<HashMap<String, String>>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let c: Confirm = if body.iter().all(u8::is_ascii_whitespace) {
+        Confirm::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(c) => c,
+            Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid json: {e}")),
+        }
+    };
     let id = job_id(&p);
     let job = match app.store.job(&user, id) {
         Ok(Some(j)) if j.status == PENDING => j,
         Ok(_) => return err(StatusCode::NOT_FOUND, "no pending routine with that id"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let next = match new_schedule(&job.schedule, now()) {
+    let tz = match zone(c.tz.as_deref().unwrap_or(&job.tz)) {
+        Ok(z) => z,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+    };
+    let next = match new_schedule(&job.schedule, &tz, now()) {
         Ok(n) => n,
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
-    match app.store.confirm_job(&user, id, next) {
+    let name = zone_name(&tz);
+    match app.store.confirm_job(&user, id, next, name) {
         Ok(0) => err(StatusCode::NOT_FOUND, "no pending routine with that id"),
-        Ok(_) => Json(json!({"job": {"id": id, "status": "active", "next_run_at": next}}))
-            .into_response(),
+        Ok(_) => {
+            Json(json!({"job": {"id": id, "status": "active", "tz": name, "next_run_at": next}}))
+                .into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -655,24 +695,18 @@ mod tests {
     async fn api_refuses_fast_or_too_many_routines() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
-        let mut app = test_app(port);
-        app.bots.insert(
-            "nexy".into(),
-            crate::bots::Bot {
-                name: "nexy".into(),
-                persona: String::new(),
-                persona_file: None,
-                tools: Vec::new(),
-                max_steps: 1,
-                max_tokens: 1,
-                max_secs: 1,
-                search_first: false,
-            },
-        );
-        let app = std::sync::Arc::new(app);
+        let app = std::sync::Arc::new(with_bot(test_app(port)));
         for i in 0..crate::store::MAX_JOBS_PER_USER - 1 {
             app.store
-                .add_job("owner", "nexy", &format!("j{i}"), "every 1h", "p", Some(1))
+                .add_job(
+                    "owner",
+                    "nexy",
+                    &format!("j{i}"),
+                    "every 1h",
+                    "UTC",
+                    "p",
+                    Some(1),
+                )
                 .unwrap();
         }
         let srv = tokio::spawn(axum::serve(l, super::router(app)).into_future());
@@ -709,6 +743,84 @@ mod tests {
         assert!(!safe_id("a/b"));
         assert!(!safe_id(""));
         assert!(!safe_id(&"x".repeat(129)));
+    }
+
+    fn with_bot(mut app: crate::App) -> crate::App {
+        app.bots.insert(
+            "nexy".into(),
+            crate::bots::Bot {
+                name: "nexy".into(),
+                persona: String::new(),
+                persona_file: None,
+                tools: Vec::new(),
+                max_steps: 1,
+                max_tokens: 1,
+                max_secs: 1,
+                search_first: false,
+            },
+        );
+        app
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn routines_api_reads_clock_times_in_the_owners_zone() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let app = std::sync::Arc::new(with_bot(test_app(port)));
+        let wait = app
+            .store
+            .add_pending_job("owner", "nexy", "w", "daily 08:00", "UTC", "p", "x")
+            .unwrap();
+        let srv = tokio::spawn(axum::serve(l, super::router(app.clone())).into_future());
+        let res = tokio::task::spawn_blocking(move || {
+            let send = |path: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+                let r = ureq::post(&format!("http://127.0.0.1:{port}{path}")).send_json(body);
+                let r = match r {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(_, r)) => r,
+                    Err(e) => panic!("{e}"),
+                };
+                (r.status(), r.into_json().unwrap())
+            };
+            let job = |tz: Option<&str>| {
+                let mut b = serde_json::json!({"name": "n", "schedule": "daily 08:00", "prompt": "p"});
+                if let Some(z) = tz {
+                    b["tz"] = z.into();
+                }
+                send("/api/jobs", b)
+            };
+            // 8 am in Manila is midnight UTC
+            let (code, made) = job(Some("Asia/Manila"));
+            assert_eq!(code, 200, "{made}");
+            assert_eq!(made["job"]["tz"], "Asia/Manila");
+            assert_eq!(made["job"]["next_run_at"].as_i64().unwrap() % 86_400, 0);
+            // no zone: UTC, as before
+            let (_, utc) = job(None);
+            assert_eq!(utc["job"]["tz"], "UTC");
+            assert_eq!(utc["job"]["next_run_at"].as_i64().unwrap() % 86_400, 8 * 3600);
+            let (code, bad) = job(Some("Mars/Olympus"));
+            assert_eq!(code, 400);
+            assert!(bad["error"].as_str().unwrap().contains("unknown time zone"));
+            // confirming from Manila reads the waiting routine's 08:00 there
+            let (code, ok) = send(
+                &format!("/api/jobs/{wait}/confirm"),
+                serde_json::json!({"tz": "Asia/Manila"}),
+            );
+            assert_eq!(code, 200, "{ok}");
+            assert_eq!(ok["job"]["tz"], "Asia/Manila");
+            assert_eq!(ok["job"]["next_run_at"].as_i64().unwrap() % 86_400, 0);
+            let chat = send(
+                "/v1/chat/completions",
+                serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "tz": "Nowhere/Land"}),
+            );
+            assert_eq!(chat.0, 400, "{}", chat.1);
+        })
+        .await;
+        srv.abort();
+        res.unwrap();
+        let jobs = app.store.jobs(Some("owner")).unwrap();
+        let tz: Vec<&str> = jobs.iter().map(|j| j.tz.as_str()).collect();
+        assert_eq!(tz, ["Asia/Manila", "Asia/Manila", "UTC"]);
     }
 
     fn test_app(port: u16) -> crate::App {
@@ -748,13 +860,14 @@ mod tests {
                 "nexy",
                 "w",
                 "every 1h",
+                "UTC",
                 "Brief me.",
                 "read_page https://a.example",
             )
             .unwrap();
         let drop_me = app
             .store
-            .add_pending_job("owner", "nexy", "d", "every 1h", "p", "x")
+            .add_pending_job("owner", "nexy", "d", "every 1h", "UTC", "p", "x")
             .unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         let srv = tokio::spawn(axum::serve(l, super::router(app.clone())).into_future());

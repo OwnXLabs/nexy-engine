@@ -85,15 +85,21 @@ whose `Host` is `127.0.0.1`, `localhost` or `[::1]` on its own port, or a name l
 - `POST /v1/responses` and `GET /v1/uhp`: the [Unified Harness Protocol](https://unifiedharnessprotocol.org)
   (core class, version 2026-10-19). Each bot is a harness.
 - `/api/sessions`, `/api/jobs`: history and scheduled tasks (routines). A schedule is `every 30m`,
-  `daily 08:00` or standard 5-field cron such as `0 9 * * 1-5`, all in UTC, and new routines run
-  at most every 5 minutes. A user keeps at most 50 routines and a bot holds at most 200, waiting
+  `daily 08:00` or standard 5-field cron such as `0 9 * * 1-5`, and new routines run at most every
+  5 minutes. Clock times are read in the owner's time zone: send an IANA name such as
+  `"tz": "Asia/Manila"` with `POST /api/jobs`, with chat completions (top level) or with responses
+  (`metadata.tz`); routines the model creates take the chat's zone. Without one it is UTC, and
+  jobs made before zones stay UTC. Clock changes keep the wall-clock time: `daily 08:00` in
+  `Europe/London` runs at 08:00 in both GMT and BST; a time skipped in spring runs just after the
+  jump, and a time repeated in autumn runs once. Unknown zones get `400`. `GET /api/jobs` lists
+  each job's `tz`. A user keeps at most 50 routines and a bot holds at most 200, waiting
   ones included (`409` when full). Bots with the `routine` tool can also create, list and delete
   routines in chat.
 - Routine approval: once outside content is in a chat's context (a web page, search result,
   command output, file or saved memory, in this turn or earlier ones, or a system message the
   caller has not vouched for), a routine the model creates is saved as `"status": "pending"`
   with no next run, and the model cannot delete routines. Only the owner can then act, through
-  `POST /api/jobs/{id}/confirm` (schedules it) or `POST /api/jobs/{id}/discard` (deletes it);
+  `POST /api/jobs/{id}/confirm` (schedules it; an optional `{"tz": …}` body sets the zone it runs in) or `POST /api/jobs/{id}/discard` (deletes it);
   neither is a tool. `GET /api/jobs` lists `status` and `origin`. A caller whose system message
   holds only its own text sends `"context_clean": true` (chat completions) or
   `metadata.context_clean` (responses).

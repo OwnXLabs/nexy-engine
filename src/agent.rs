@@ -40,19 +40,20 @@ pub struct Input<'a> {
     pub outside: bool,
     pub owner: bool,
     pub research: Option<bool>,
+    pub tz: jiff::tz::TimeZone, // the owner's zone: "8 am" in a routine means 8 am there
     pub workspace: Option<&'a std::path::Path>,
     pub cancel: Option<&'a AtomicBool>,
     pub progress: Option<&'a Progress<'a>>,
     pub on_text: Option<&'a dyn Fn(&str)>,
 }
 
-fn system_prompt(bot: &Bot, mode: Mode, tools: &[&Tool]) -> String {
-    format!(
-        "{}\n\nToday is {} (UTC). Treat this as the current date; your training data is older.{RULES}{}",
+fn system_prompt(bot: &Bot, mode: Mode, tools: &[&Tool], tz: &jiff::tz::TimeZone) -> Value {
+    json!({"role": "system", "content": format!(
+        "{}\n\nToday is {}. Treat this as the current date; your training data is older.{RULES}{}",
         bot.persona.trim(),
-        &crate::store::utc_now()[..10],
+        crate::scheduler::today(tz),
         protocol::tool_text(mode, tools)
-    )
+    )})
 }
 
 struct Run<'a> {
@@ -159,7 +160,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
         .append(input.session, "user", input.text, None)
         .map_err(db)?;
 
-    let mut last = format!("Now: {}", crate::store::utc_now());
+    let mut last = format!("Now: {}", crate::scheduler::now_line(&input.tz));
     if let Some(c) = input.context.filter(|c| !c.trim().is_empty()) {
         last.push_str("\n\nContext from Nexy:\n");
         last.push_str(c.trim());
@@ -167,7 +168,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
     last.push_str("\n\n");
     last.push_str(input.text);
 
-    let mut msgs = vec![json!({"role": "system", "content": system_prompt(bot, mode, &tools)})];
+    let mut msgs = vec![system_prompt(bot, mode, &tools, &input.tz)];
     msgs.extend(hist);
     msgs.push(json!({"role": "user", "content": last}));
 
@@ -196,6 +197,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
             owner: input.owner,
             outside: tools::outside_before(store, input.session, input.outside).map_err(db)?,
             notes: Default::default(),
+            tz: input.tz.clone(),
         },
         session: input.session,
         turn: Turn {
@@ -262,7 +264,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
             Err(e) if mode != Mode::Text && !repaired && e.starts_with("model server 5") => {
                 repaired = true;
                 mode = Mode::Text;
-                msgs[0] = json!({"role": "system", "content": system_prompt(bot, mode, &tools)});
+                msgs[0] = system_prompt(bot, mode, &tools, &input.tz);
                 r.turn.mode = format!(
                     "text (fallback after: {})",
                     e.chars().take(80).collect::<String>()
@@ -336,8 +338,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                     .map_err(db)?;
                 if mode == Mode::Native {
                     mode = Mode::Text;
-                    msgs[0] =
-                        json!({"role": "system", "content": system_prompt(bot, mode, &tools)});
+                    msgs[0] = system_prompt(bot, mode, &tools, &input.tz);
                     r.turn.mode = "text (fallback)".into();
                 } else {
                     msgs.push(json!({"role": "assistant", "content": reply.content}));
@@ -448,7 +449,9 @@ mod tests {
             search_first: false,
         };
         for mode in [Mode::Text, Mode::Json] {
-            let n = system_prompt(&bot, mode, &all).len();
+            let n = system_prompt(&bot, mode, &all, &jiff::tz::TimeZone::UTC)["content"]
+                .as_str()
+                .map_or(0, str::len);
             assert!(
                 n <= 6000,
                 "{mode:?} system prompt is {n} chars, budget 6000"

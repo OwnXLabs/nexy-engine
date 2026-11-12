@@ -410,6 +410,19 @@ async fn create(
             (bot, id("hsess"))
         }
     };
+    // the owner's zone for clock times in routines, e.g. "Asia/Manila"
+    let tz = match crate::scheduler::zone(body["metadata"]["tz"].as_str().unwrap_or("")) {
+        Ok(z) => z,
+        Err(e) => {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_tz",
+                &e,
+                Value::Null,
+            );
+        }
+    };
     if app.tasks.busy(&session) {
         return fail(
             StatusCode::CONFLICT,
@@ -487,6 +500,7 @@ async fn create(
                 outside: !clean,
                 owner: true,
                 research,
+                tz,
                 workspace: None,
                 cancel: Some(&t.cancel),
                 progress: Some(&progress),
