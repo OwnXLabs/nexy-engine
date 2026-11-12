@@ -172,6 +172,35 @@ pub const ALL: &[Tool] = &[
     },
 ];
 
+/// Can this machine run `t`? Web search needs a search service, which a computer may not have
+/// (Nexy on Windows); reading a page is a plain fetch and works everywhere.
+pub fn available(t: &Tool, searxng: Option<&str>) -> bool {
+    t.name != "web_search" || searxng.is_some()
+}
+
+/// The bot's tools that this machine can run.
+pub fn offered(names: &[String], searxng: Option<&str>) -> Vec<&'static Tool> {
+    names
+        .iter()
+        .filter_map(|n| find(n))
+        .filter(|t| available(t, searxng))
+        .collect()
+}
+
+/// A rule for the model when the bot has web search but this machine can't run it, so it says so
+/// plainly instead of trying.
+pub fn missing_note(names: &[String], offered: &[&Tool]) -> &'static str {
+    let has = |n: &str| offered.iter().any(|t| t.name == n);
+    if names.iter().any(|n| n == "web_search") && !has("web_search") {
+        NO_SEARCH
+    } else {
+        ""
+    }
+}
+
+/// What the model is told when its bot has web search but this machine can't run it.
+pub const NO_SEARCH: &str = "\n- Web search isn't on this computer yet, so you have no web_search tool. When the user asks you to search the web or for something recent you can't know, say plainly: \"Web search isn't on this computer yet.\" Then help with what you know, and say it may be out of date. read_page still reads a link the user gives.";
+
 pub fn find(name: &str) -> Option<&'static Tool> {
     ALL.iter().find(|t| t.name == name)
 }
@@ -951,7 +980,7 @@ pub fn over_limit(tool: &str, done: usize) -> Option<String> {
 }
 
 fn web_search(base: Option<&str>, q: &str) -> Result<String, String> {
-    let base = base.ok_or("web search is not configured on this machine")?;
+    let base = base.ok_or("web search isn't on this computer yet")?;
     let v: Value = agent()
         .get(&format!("{base}/search"))
         .query("q", q)
@@ -1226,6 +1255,99 @@ mod tests {
             "searches that left the machine"
         );
         assert_eq!(turn.reply, "Here is what I found.");
+    }
+
+    static SEEN: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+    /// A stand-in model that keeps every request and answers in words.
+    async fn listening_model() -> String {
+        async fn chat(axum::Json(b): axum::Json<Value>) -> String {
+            SEEN.lock().unwrap().push(b);
+            json!({"choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Done."}}]}).to_string()
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(
+            axum::serve(
+                l,
+                axum::Router::new().route("/v1/chat/completions", axum::routing::post(chat)),
+            )
+            .into_future(),
+        );
+        model
+    }
+
+    /// QA 0.2.9 on Windows: no search service there, yet the model was offered web_search, called it,
+    /// and told the owner to check whether the device meets the requirements. Without a search service
+    /// it is not offered, the model is told to say so plainly, and read_page (a plain fetch) stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn web_search_is_offered_only_where_it_can_run() {
+        let model = listening_model().await;
+        for searx in [None, Some("http://127.0.0.1:9".to_string())] {
+            SEEN.lock().unwrap().clear();
+            let mut app = with_bot(test_app(9));
+            let bot = app.bots.get_mut("nexy").unwrap();
+            bot.tools = vec!["web_search".into(), "read_page".into(), "remember".into()];
+            (bot.max_steps, bot.max_tokens, bot.max_secs) = (2, 64, 60);
+            app.cfg.searxng_url = searx.clone();
+            app.backend = crate::model::Backend::new(&model, "m", None);
+            *app.backend.caps.write().unwrap() = crate::model::Caps {
+                mode: crate::model::Mode::Native,
+                native_tools: true,
+                probed_at: 1,
+                ..Default::default()
+            };
+            let turn = tokio::task::spawn_blocking(move || {
+                let bot = app.bots.get("nexy").unwrap().clone();
+                crate::agent::run(
+                    &app,
+                    &bot,
+                    crate::agent::Input {
+                        user: "a",
+                        session: "s-nosearch",
+                        text: "search the web for rice prices in manila today",
+                        context: None,
+                        outside: false,
+                        owner: true,
+                        research: Some(true),
+                        tz: jiff::tz::TimeZone::UTC,
+                        workspace: None,
+                        cancel: None,
+                        progress: None,
+                        on_text: None,
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let seen = SEEN.lock().unwrap();
+            let req = seen.first().expect("the model was asked");
+            let offered: Vec<&str> = req["tools"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t["function"]["name"].as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let system = req["messages"][0]["content"].as_str().unwrap_or("");
+            if searx.is_none() {
+                assert!(turn.tools.is_empty(), "nothing searched: {:?}", turn.tools);
+                assert_eq!(offered, ["read_page", "remember"], "{offered:?}");
+                assert!(
+                    system.contains("Web search isn't on this computer yet"),
+                    "{system}"
+                );
+            } else {
+                assert_eq!(
+                    offered,
+                    ["web_search", "read_page", "remember"],
+                    "{offered:?}"
+                );
+                assert!(!system.contains("isn't on this computer"), "{system}");
+            }
+        }
     }
 
     #[test]

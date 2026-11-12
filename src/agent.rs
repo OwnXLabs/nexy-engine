@@ -51,10 +51,10 @@ pub struct Input<'a> {
 
 fn system_prompt(bot: &Bot, mode: Mode, tools: &[&Tool], tz: &jiff::tz::TimeZone) -> Value {
     json!({"role": "system", "content": format!(
-        "{}\n\nToday is {}. Treat this as the current date; your training data is older.{RULES}{}",
+        "{}\n\nToday is {}. Treat this as the current date; your training data is older.{RULES}{}{}",
         bot.persona.trim(),
         crate::scheduler::today(tz),
-        protocol::tool_text(mode, tools)
+        tools::missing_note(&bot.tools, tools), protocol::tool_text(mode, tools)
     )})
 }
 
@@ -128,7 +128,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
     crate::ensure_probed(app);
     let caps = app.backend.caps.read().unwrap().clone();
     let mut mode = caps.mode;
-    let tools: Vec<&Tool> = bot.tools.iter().filter_map(|n| tools::find(n)).collect();
+    let tools = tools::offered(&bot.tools, app.cfg.searxng_url.as_deref());
     let store = &app.store;
     store
         .ensure_session(
