@@ -54,7 +54,7 @@ pub fn now_line(tz: &TimeZone) -> String {
 }
 
 /// A schedule as it is stored: "every 30m", "daily 08:15" or 5-field cron. Also takes
-/// "weekdays 07:30", "weekends 9am", "monday 18:45", and cron with the time in the hour field
+/// "weekdays 07:30", "weekends 9am", "monday 18:45", "mon, thu 9am", and cron with the time in the hour field
 /// ("0 7:30 * * 1-5" is 07:30, not 07:00). Anything else is refused, never read as another time.
 pub fn canonical(schedule: &str) -> Result<String, String> {
     let s = schedule
@@ -95,25 +95,52 @@ pub fn canonical(schedule: &str) -> Result<String, String> {
         .ok_or_else(|| bad(schedule))
 }
 
-/// "daily 08:15", "weekdays 7:30 am", "every monday at 18:45": `None` when it is not of this form,
-/// `Some(None)` when it is but the time is not a time.
+/// "daily 08:15", "weekdays 7:30 am", "every monday at 18:45", "weekly on mondays at 9am",
+/// "mon, thu 09:00": `None` when it is not of this form, `Some(None)` when it is but the time is
+/// not a time.
 fn friendly(s: &str) -> Option<Option<String>> {
-    let s = s.strip_prefix("every ").unwrap_or(s);
-    let (days, at) = s.split_once(' ')?;
-    let dow = match days.trim_end_matches(',') {
-        "daily" | "day" => "*".to_string(),
-        "weekday" | "weekdays" => "1-5".into(),
-        "weekend" | "weekends" => "0,6".into(),
-        d => {
-            let d = d.strip_suffix('s').filter(|x| x.len() > 2).unwrap_or(d);
-            let i = DAYS
-                .iter()
-                .position(|n| d.starts_with(n) && DAY_NAMES.iter().any(|f| f.starts_with(d)))?;
-            i.to_string()
+    let mut s = s;
+    while let Some(rest) = ["every ", "each ", "weekly ", "week ", "on "]
+        .iter()
+        .find_map(|p| s.strip_prefix(p))
+    {
+        s = rest;
+    }
+    // the days, then the time: "monday and thursday at 9am", "mon,thu 09:00"
+    let (days, at) = match s.split_once(" at ") {
+        Some(v) => v,
+        None => s.split_at(s.find(|c: char| c.is_ascii_digit())?),
+    };
+    let words: Vec<&str> = days
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let dow = match words.as_slice() {
+        [] => return None,
+        ["daily" | "day"] => "*".to_string(),
+        ["weekday" | "weekdays"] => "1-5".into(),
+        ["weekend" | "weekends"] => "0,6".into(),
+        [.., "and"] | ["and", ..] => return None,
+        ws => {
+            let mut v = Vec::new();
+            for w in ws.iter().filter(|w| **w != "and") {
+                let d = w.strip_suffix('s').filter(|x| x.len() > 2).unwrap_or(w);
+                let i = DAYS
+                    .iter()
+                    .position(|n| d.starts_with(n) && DAY_NAMES.iter().any(|f| f.starts_with(d)))?;
+                if !v.contains(&i) {
+                    v.push(i);
+                }
+            }
+            v.sort_unstable();
+            v.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         }
     };
-    let at = at.trim().strip_prefix("at ").unwrap_or(at.trim());
-    Some(clock(at).map(|(h, m)| {
+    let at = at.trim();
+    Some(clock(at.strip_prefix("at ").unwrap_or(at)).map(|(h, m)| {
         if dow == "*" {
             format!("daily {h:02}:{m:02}")
         } else {
@@ -224,7 +251,7 @@ pub const UNSUPPORTED: &str = "unsupported schedule";
 
 fn bad(s: &str) -> String {
     format!(
-        "{UNSUPPORTED} \"{s}\": use \"daily 08:15\", \"weekdays 07:30\", \"every 30m\", \"every 2h\" or 5-field cron \
+        "{UNSUPPORTED} \"{s}\": use \"daily 08:15\", \"weekdays 07:30\", \"monday 09:00\", \"every 30m\", \"every 2h\" or 5-field cron \
          \"minute hour day month weekday\" such as \"30 7 * * 1-5\" (07:30 on weekdays), in the owner's time zone"
     )
 }
@@ -645,6 +672,38 @@ mod tests {
             new_schedule("0 7:30 * * 1-5", &manila, from).unwrap().0,
             "30 7 * * 1-5"
         );
+    }
+
+    /// QA 0.2.11: "every monday at 9am" was made daily, then deleted as "not supported". Each way
+    /// a model writes one day a week, or a few, is that day; a word that is no day is refused.
+    #[test]
+    fn days_of_the_week() {
+        use super::canonical;
+        for (said, kept) in [
+            ("monday 09:00", "0 9 * * 1"),
+            ("every monday at 9am", "0 9 * * 1"),
+            ("Mondays at 9am", "0 9 * * 1"),
+            ("mon 09:00", "0 9 * * 1"),
+            ("weekly monday 09:00", "0 9 * * 1"),
+            ("weekly on monday at 9am", "0 9 * * 1"),
+            ("every week on Monday at 09:00", "0 9 * * 1"),
+            ("on mondays at 9:00", "0 9 * * 1"),
+            ("monday, thursday 9am", "0 9 * * 1,4"),
+            ("mon,thu 09:00", "0 9 * * 1,4"),
+            ("every monday and thursday at 9am", "0 9 * * 1,4"),
+            ("0 9 * * 1", "0 9 * * 1"),
+        ] {
+            assert_eq!(canonical(said).as_deref(), Ok(kept), "{said}");
+        }
+        for bad in [
+            "weekly 09:00",
+            "moon 09:00",
+            "on 09:00",
+            "monday and 9am",
+            "mo 09:00",
+        ] {
+            assert!(canonical(bad).is_err(), "{bad}");
+        }
     }
 
     const FRI_2026_11_06_1000: i64 = 1_793_959_200;

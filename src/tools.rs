@@ -151,7 +151,7 @@ pub const ALL: &[Tool] = &[
             Param {
                 name: "schedule",
                 kind: "string?",
-                desc: "in the user's local time (see Now), minutes included: \"daily 08:15\", \"weekdays 07:30\", \"every 2h\", or 5-field cron \"minute hour day month weekday\" such as \"30 7 * * 1-5\" for 7:30 on weekdays (create)",
+                desc: "in the user's local time (see Now), minutes included: \"daily 08:15\", \"weekdays 07:30\", \"monday 09:00\" (one day a week; \"mon, thu 09:00\" for several), \"every 2h\", or 5-field cron \"minute hour day month weekday\" such as \"30 7 * * 1-5\" for 7:30 on weekdays or \"0 9 * * 1\" for 9:00 on Mondays (create)",
             },
             Param {
                 name: "trigger",
@@ -629,13 +629,26 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
                      Tell them they can delete it in Routines."
                     .into());
             }
+            let job = cx.store.job(cx.user, id).map_err(|e| e.to_string())?;
             match cx
                 .store
                 .delete_job(cx.user, id)
                 .map_err(|e| e.to_string())?
             {
                 0 => Err(format!("there is no routine {id}")),
-                _ => Ok(format!("deleted routine {id}")),
+                _ => {
+                    // made, then deleted in the same turn: it is not said saved (QA 0.2.11)
+                    if let Some(j) = &job {
+                        let (saved, waits) = (
+                            format!("Routine saved: \"{}\",", j.name),
+                            format!("The routine \"{}\" ", j.name),
+                        );
+                        cx.notes
+                            .borrow_mut()
+                            .retain(|n| !n.starts_with(&saved) && !n.starts_with(&waits));
+                    }
+                    Ok(format!("deleted routine {id}"))
+                }
             }
         }
         other => Err(format!(
@@ -1644,6 +1657,55 @@ mod tests {
             1,
             "a tainted delete removed it"
         );
+    }
+
+    /// QA 0.2.11: made "daily 09:00", deleted it, said Mondays can't be done; the reply still said
+    /// 'Routine saved: "order coffee beans", every day at 09:00' with no routine left.
+    #[test]
+    fn a_routine_deleted_in_the_turn_is_not_said_saved() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let cx = clean(&store);
+        let t = find("routine").unwrap();
+        let made = |sched: &str| {
+            run(
+                t,
+                &json!({"action": "create", "name": "order coffee beans", "schedule": sched, "prompt": "Remind me to order more coffee beans."}),
+                &cx,
+            )
+        };
+        assert!(
+            made("daily 09:00")
+                .unwrap()
+                .starts_with("created routine 1")
+        );
+        run(t, &json!({"action": "delete", "id": 1}), &cx).unwrap();
+        let mut reply = "I can't set a routine for Mondays.".to_string();
+        with_notes(&cx, &mut reply);
+        assert_eq!(reply, "I can't set a routine for Mondays.");
+        // the one that stands is said; the weekday form is there to use
+        let d = find("routine")
+            .unwrap()
+            .params
+            .iter()
+            .find(|p| p.name == "schedule")
+            .unwrap()
+            .desc;
+        assert!(
+            d.contains("\"monday 09:00\"") && d.contains("0 9 * * 1"),
+            "{d}"
+        );
+        let out = run(t, &json!({"action": "create", "name": "beans monday", "schedule": "monday 09:00", "prompt": "Order beans."}), &cx).unwrap();
+        assert!(
+            out.contains("(0 9 * * 1, UTC): runs every Monday at 09:00"),
+            "{out}"
+        );
+        let mut reply = "Done.".to_string();
+        with_notes(&cx, &mut reply);
+        assert!(
+            reply.starts_with("Done.\n\nRoutine saved: \"beans monday\", every Monday at 09:00."),
+            "{reply}"
+        );
+        assert!(!reply.contains("every day"), "{reply}");
     }
 
     #[test]

@@ -87,8 +87,9 @@ whose `Host` is `127.0.0.1`, `localhost` or `[::1]` on its own port, or a name l
 - `POST /v1/responses` and `GET /v1/uhp`: the [Unified Harness Protocol](https://unifiedharnessprotocol.org)
   (core class, version 2026-10-19). Each bot is a harness.
 - `/api/sessions`, `/api/jobs`: history and scheduled tasks (routines). A schedule is `every 30m`,
-  `daily 08:00` or standard 5-field cron such as `0 9 * * 1-5`, and new routines run at most every
-  5 minutes. Clock times are read in the owner's time zone: send an IANA name such as
+  `daily 08:00` or standard 5-field cron such as `0 9 * * 1-5`; day names are also taken
+  (`monday 09:00`, `weekly on mondays at 9am`, `mon, thu 09:00`) and stored as cron. New routines
+  run at most every 5 minutes. Clock times are read in the owner's time zone: send an IANA name such as
   `"tz": "Asia/Manila"` with `POST /api/jobs`, with chat completions (top level) or with responses
   (`metadata.tz`); routines the model creates take the chat's zone. Without one it is UTC, and
   jobs made before zones stay UTC. Clock changes keep the wall-clock time: `daily 08:00` in
