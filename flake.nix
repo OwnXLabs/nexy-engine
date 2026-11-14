@@ -54,7 +54,7 @@
           };
 
           config = mkIf cfg.enable {
-            # a static user: DynamicUser breaks StateDirectory in Own1 containers
+            # a static user: DynamicUser breaks StateDirectory in NixOS containers
             users.users.nexy-engine = { isSystemUser = true; group = "nexy-engine"; home = "/var/lib/nexy-engine"; };
             users.groups.nexy-engine = { };
             systemd.services.nexy-engine = {
