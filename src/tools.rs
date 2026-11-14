@@ -637,7 +637,7 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
             {
                 0 => Err(format!("there is no routine {id}")),
                 _ => {
-                    // made, then deleted in the same turn: it is not said saved (QA 0.2.11)
+                    // made, then deleted in the same turn: it is not said saved
                     if let Some(j) = &job {
                         let (saved, waits) = (
                             format!("Routine saved: \"{}\",", j.name),
@@ -659,7 +659,7 @@ fn routine(args: &Value, cx: &Ctx) -> Result<String, String> {
 
 /// The schedule to store and its first run. A schedule that cannot be read is refused, and the
 /// time it named is kept: a later try this turn at another time is refused too, so a routine the
-/// owner asked for at 7:30 is never quietly saved at 7:00 (QA 0.2.9).
+/// owner asked for at 7:30 is never quietly saved at 7:00.
 fn saved_schedule(cx: &Ctx, schedule: &str) -> Result<(String, i64), String> {
     use crate::scheduler::{UNSUPPORTED, clock, new_schedule, time_of_day};
     let (stored, next) = match new_schedule(schedule, &cx.tz, crate::store::now()) {
@@ -690,8 +690,8 @@ fn saved_schedule(cx: &Ctx, schedule: &str) -> Result<(String, i64), String> {
     Ok((stored, next))
 }
 
-/// A routine for the same thing made this recently is the same request made twice: Nexy set it from
-/// the owner's words, then the turn that ran it once made it again at a time of its own (QA 0.2.8).
+/// A routine for the same thing made this recently is the same request made twice, such as a
+/// turn that runs a routine once and makes it again at a time of its own.
 pub const SAME_ROUTINE_SECS: i64 = 300;
 
 /// The words that say what a routine does, without filler such as "remind me to" or "the user".
@@ -977,8 +977,8 @@ fn public_agent() -> ureq::Agent {
 }
 
 /// How many times a tool that reaches the internet may run in one answer. A model can ask for
-/// many searches in a step and keep asking: one "Continue" ran 34 in 143 s (QA 2026-11-12),
-/// enough to get the owner's address throttled. Past the limit nothing leaves the machine.
+/// many searches in a step and keep asking, enough to get the owner's address throttled. Past the
+/// limit nothing leaves the machine.
 pub const MAX_SEARCHES: usize = 3;
 pub const MAX_PAGES: usize = 5;
 
@@ -1290,9 +1290,8 @@ mod tests {
         model
     }
 
-    /// QA 0.2.9 on Windows: no search service there, yet the model was offered web_search, called it,
-    /// and told the owner to check whether the device meets the requirements. Without a search service
-    /// it is not offered, the model is told to say so plainly, and read_page (a plain fetch) stays.
+    /// Without a search service web_search is not offered, the model is told to say so plainly,
+    /// and read_page (a plain fetch) stays.
     #[tokio::test(flavor = "multi_thread")]
     async fn web_search_is_offered_only_where_it_can_run() {
         let model = listening_model().await;
@@ -1659,8 +1658,7 @@ mod tests {
         );
     }
 
-    /// QA 0.2.11: made "daily 09:00", deleted it, said Mondays can't be done; the reply still said
-    /// 'Routine saved: "order coffee beans", every day at 09:00' with no routine left.
+    /// A routine made and deleted in one turn is never reported as 'Routine saved'.
     #[test]
     fn a_routine_deleted_in_the_turn_is_not_said_saved() {
         let store = Store::open(Path::new(":memory:")).unwrap();
@@ -1939,8 +1937,8 @@ mod tests {
         assert!(full.is_err_and(|e| e.contains("limit")));
     }
 
-    /// QA 0.2.8: "Every weekday at 7:30 am, remind me to count the rice and canned goods stock."
-    /// Nexy set it from those words; the turn that ran it once made a second at "daily 08:00".
+    /// "Every weekday at 7:30 am, remind me to count the stock." is one routine, even when the
+    /// turn that runs it once tries to make a second at "daily 08:00".
     #[test]
     fn one_request_makes_one_routine() {
         let store = Store::open(Path::new(":memory:")).unwrap();
@@ -2013,9 +2011,8 @@ mod tests {
         );
     }
 
-    /// QA 0.2.9: "remind me every weekday at 7:30 to check the fridge temperature". The model sent
-    /// "0 7:30 * * 1-5", was refused, saved "0 7 * * 1-5" (07:00) and told the owner it only does
-    /// whole hours.
+    /// "remind me every weekday at 7:30": a refused "0 7:30 * * 1-5" is never retried as
+    /// "0 7 * * 1-5" (07:00).
     #[test]
     fn a_time_with_minutes_is_kept_never_changed() {
         let store = Store::open(Path::new(":memory:")).unwrap();

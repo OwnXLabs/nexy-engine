@@ -233,8 +233,7 @@ impl Event {
     }
 
     /// The run's context: everything the event carried, fenced as untrusted, and said to be
-    /// what the routine is about. Given as a bare block, a run asked the owner for the mail's
-    /// text it already had (QA 0.2.9).
+    /// what the routine is about, so a run never asks the owner for text it already has.
     fn context(&self) -> String {
         let what = match self.source.as_str() {
             "mail" => "a new email",
@@ -808,7 +807,7 @@ mod tests {
         url
     }
 
-    /// QA 0.2.9: a mail run asked the owner for the mail's text. The run's prompt holds the whole
+    /// The run's prompt holds the whole
     /// mail, labelled, said to be what the task is about, and still fenced as outside content.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_mail_run_is_given_the_mail_itself() {

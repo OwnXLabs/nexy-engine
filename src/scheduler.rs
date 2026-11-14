@@ -469,8 +469,8 @@ pub fn execute(app: &App, job: &Job, tz: TimeZone, event: Option<&str>, title: &
     ) {
         eprintln!("scheduler: job {}: session: {e}", job.id);
     }
-    // The run is the delivery: asked "remind me to X", the model answered "I can't send a direct
-    // reminder" (QA 2026-11-13). It is told it is the routine reaching the owner, and to give the result.
+    // The run is the delivery: the model is told it is the routine reaching the owner, and to give
+    // the result, never "I can't send a direct reminder".
     let text = routine_turn(&job.name, &job.prompt);
     let reply = crate::agent::run(
         app,
@@ -614,7 +614,7 @@ mod tests {
         );
     }
 
-    /// QA 0.2.9: a time with minutes is read as that time, in the forms a model writes it;
+    /// A time with minutes is read as that time, in the forms a model writes it;
     /// one that cannot be read is refused, never taken as another time.
     #[test]
     fn minutes_are_kept() {
@@ -674,8 +674,7 @@ mod tests {
         );
     }
 
-    /// QA 0.2.11: "every monday at 9am" was made daily, then deleted as "not supported". Each way
-    /// a model writes one day a week, or a few, is that day; a word that is no day is refused.
+    /// "every monday at 9am" is Mondays, not daily. Each way a model writes one day a week, or a few, is that day; a word that is no day is refused.
     #[test]
     fn days_of_the_week() {
         use super::canonical;
