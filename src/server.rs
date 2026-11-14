@@ -237,9 +237,10 @@ async fn chat(
         .iter()
         .find(|m| m["role"] == "system")
         .map(text);
+    // x-hermes-session-id is deprecated, accepted from older clients
     let session = headers
-        .get("x-hermes-session-id")
-        .or_else(|| headers.get("x-session-id"))
+        .get("x-session-id")
+        .or_else(|| headers.get("x-hermes-session-id"))
         .and_then(|v| v.to_str().ok())
         .map(String::from)
         .unwrap_or_else(|| {
@@ -1004,8 +1005,7 @@ pub(crate) mod tests {
         url
     }
 
-    /// QA 0.2.9: the first run of a new routine was a chat turn about it, and the model said it
-    /// cannot run routines. The owner's run-now is the scheduler's run, and its reply comes back.
+    /// The owner's run-now is the scheduler's run, not a chat turn about it, and its reply comes back.
     #[tokio::test(flavor = "multi_thread")]
     async fn owner_runs_a_routine_now_and_gets_its_result() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1203,7 +1203,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// QA 0.2.8: a model server killed mid-answer whose stream still ended cleanly. Without the
+    /// A model server killed mid-answer whose stream still ended cleanly: without the
     /// model's own end marker the turn is a broken one (the owner is offered Continue), never an
     /// answer that looks whole.
     #[tokio::test(flavor = "multi_thread")]
