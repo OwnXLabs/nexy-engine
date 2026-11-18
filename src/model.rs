@@ -59,6 +59,28 @@ impl Default for Caps {
 }
 
 impl Caps {
+    /// Abilities the caller states instead of a probe: how thinking is turned off ("template_kwargs",
+    /// "reasoning_effort", "both", "think_false", "no_thinking", "stays_on") and how tools are called
+    /// ("native", "json", "text"). Unstated, they are what works on any OpenAI-style server: the
+    /// chat_template_kwargs switch and tools written as text.
+    pub fn stated(think_off: Option<&str>, tools: Option<&str>) -> Result<Caps, String> {
+        fn one<T: serde::de::DeserializeOwned>(what: &str, v: &str) -> Result<T, String> {
+            serde_json::from_value(Value::String(v.trim().to_ascii_lowercase()))
+                .map_err(|_| format!("{what}: unknown value \"{v}\""))
+        }
+        let mut c = Caps::default();
+        if let Some(t) = think_off {
+            c.think_off = one("NEXY_ENGINE_THINK_OFF", t)?;
+        }
+        if let Some(m) = tools {
+            c.mode = one("NEXY_ENGINE_TOOLS", m)?;
+        }
+        c.native_tools = c.mode == Mode::Native;
+        c.json_schema = c.mode == Mode::Json;
+        c.probed_at = crate::store::now();
+        Ok(c)
+    }
+
     pub fn prompt_chars(&self, max_tokens: u32) -> usize {
         if self.num_ctx == 0 {
             return usize::MAX;
@@ -685,6 +707,31 @@ mod tests {
         );
         assert_eq!(at(32_768, ThinkOff::StaysOn).max_tokens(4096), 8192);
         assert_eq!(at(0, ThinkOff::StaysOn).max_tokens(4096), 16_384);
+    }
+
+    #[test]
+    fn stated_abilities_need_no_probe() {
+        let c = Caps::stated(None, None).unwrap();
+        assert_eq!(
+            (c.mode, c.think_off, c.native_tools, c.json_schema),
+            (Mode::Text, ThinkOff::TemplateKwargs, false, false)
+        );
+        assert!(c.probed_at != 0, "known, so never probed");
+        let c = Caps::stated(Some("Reasoning_Effort"), Some("native")).unwrap();
+        assert_eq!(
+            (c.mode, c.think_off, c.native_tools),
+            (Mode::Native, ThinkOff::ReasoningEffort, true)
+        );
+        assert!(
+            Caps::stated(Some("off"), None)
+                .unwrap_err()
+                .contains("NEXY_ENGINE_THINK_OFF")
+        );
+        assert!(
+            Caps::stated(None, Some("yes"))
+                .unwrap_err()
+                .contains("NEXY_ENGINE_TOOLS")
+        );
     }
 
     #[test]

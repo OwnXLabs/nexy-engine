@@ -13,6 +13,11 @@ pub struct Config {
     pub slots: usize,
     pub api_key: Option<String>,
     pub caps_file: Option<PathBuf>,
+    /// NEXY_ENGINE_PROBE=off: never send the model test requests (a metered model counts each one);
+    /// its abilities come from NEXY_ENGINE_CAPS_FILE, or NEXY_ENGINE_THINK_OFF and NEXY_ENGINE_TOOLS
+    pub probe: bool,
+    pub think_off: Option<String>,
+    pub tools: Option<String>,
     /// extra Host names a keyless engine answers to, from NEXY_ENGINE_HOSTS (comma separated)
     pub hosts: Vec<String>,
 }
@@ -48,6 +53,14 @@ impl Config {
                 .max(1),
             api_key: var("NEXY_ENGINE_KEY"),
             caps_file: var("NEXY_ENGINE_CAPS_FILE").map(PathBuf::from),
+            probe: !var("NEXY_ENGINE_PROBE").is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "no"
+                )
+            }),
+            think_off: var("NEXY_ENGINE_THINK_OFF"),
+            tools: var("NEXY_ENGINE_TOOLS"),
             hosts: var("NEXY_ENGINE_HOSTS")
                 .map(|v| {
                     v.split(',')

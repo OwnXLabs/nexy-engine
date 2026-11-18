@@ -38,7 +38,10 @@ pub struct App {
 }
 
 fn build() -> Result<App, String> {
-    let cfg = config::Config::from_env();
+    build_with(config::Config::from_env())
+}
+
+fn build_with(cfg: config::Config) -> Result<App, String> {
     std::fs::create_dir_all(&cfg.data_dir)
         .map_err(|e| format!("{}: {e}", cfg.data_dir.display()))?;
     let store = store::Store::open(&cfg.data_dir.join("engine.db"))
@@ -58,11 +61,25 @@ fn build() -> Result<App, String> {
                 serde_json::from_str::<model::Caps>(&t).map_err(|e| format!("{}: {e}", f.display()))
             })
     });
-    if let Some(c) = fixed.transpose()?.or_else(|| {
-        read_caps(&cfg.data_dir)
-            .remove(&key)
-            .filter(|c| c.version == model::CAPS_VERSION)
-    }) {
+    let fixed = fixed.transpose()?;
+    let known = if cfg.probe {
+        fixed.or_else(|| {
+            read_caps(&cfg.data_dir)
+                .remove(&key)
+                .filter(|c| c.version == model::CAPS_VERSION)
+        })
+    } else {
+        // no probe: a caps file as given, else what the caller states; known either way
+        let mut c = match fixed {
+            Some(c) => c,
+            None => model::Caps::stated(cfg.think_off.as_deref(), cfg.tools.as_deref())?,
+        };
+        if c.probed_at == 0 {
+            c.probed_at = store::now();
+        }
+        Some(c)
+    };
+    if let Some(c) = known {
         *backend.caps.write().unwrap() = c;
     }
     Ok(App {
@@ -101,7 +118,8 @@ fn probe(app: &App) -> Result<model::Caps, String> {
 const PROBE_RETRY_SECS: i64 = 30;
 
 pub fn ensure_probed(app: &App) -> bool {
-    if app.backend.caps.read().unwrap().probed_at != 0 {
+    // probing off: the abilities are as stated at start, and the model is never tested
+    if !app.cfg.probe || app.backend.caps.read().unwrap().probed_at != 0 {
         return true;
     }
     let now = store::now();
@@ -314,6 +332,13 @@ async fn serve(app: Arc<App>) -> i32 {
         origin(&app.cfg.model_url),
         app.bots.keys().collect::<Vec<_>>()
     );
+    if !app.cfg.probe {
+        let c = app.backend.caps.read().unwrap().clone();
+        eprintln!(
+            "probe off: mode {:?}, thinking off by {:?}",
+            c.mode, c.think_off
+        );
+    }
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -338,6 +363,122 @@ mod log_tests {
         assert_eq!(
             super::origin("http://127.0.0.1:11434"),
             "http://127.0.0.1:11434"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A model server that counts chat requests and answers each with "Paris."
+    async fn counting_model() -> (String, Arc<AtomicUsize>) {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = n.clone();
+        let chat = move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                axum::Json(
+                    serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "Paris."}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 2}}),
+                )
+            }
+        };
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let r = axum::Router::new().route("/v1/chat/completions", axum::routing::post(chat));
+        tokio::spawn(axum::serve(l, r).into_future());
+        (url, n)
+    }
+
+    fn app_on(url: &str, probe: bool, tools: Option<&str>) -> super::App {
+        let mut cfg = crate::config::Config::from_env();
+        let dir = std::env::temp_dir().join(format!(
+            "nexy-probe-{}-{probe}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (cfg.model_url, cfg.model, cfg.data_dir, cfg.packs_dir) =
+            (url.into(), "m".into(), dir, "packs".into());
+        (cfg.caps_file, cfg.probe, cfg.think_off, cfg.tools) =
+            (None, probe, None, tools.map(String::from));
+        super::build_with(cfg).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_probing_off_a_metered_model_gets_only_the_users_turns() {
+        let (url, calls) = counting_model().await;
+        let app = app_on(&url, false, None);
+        let ok = tokio::task::spawn_blocking(move || {
+            // the start-up check and every turn's check, repeated: no requests, no retry later
+            let ok = (0..3).all(|_| super::ensure_probed(&app));
+            let before = calls.load(Ordering::SeqCst);
+            let b = &app.bots[&app.default_bot];
+            let t = crate::agent::run(
+                &app,
+                b,
+                crate::agent::Input {
+                    user: crate::store::DEFAULT_USER,
+                    session: "s",
+                    text: "Name the capital of France.",
+                    context: None,
+                    outside: false,
+                    owner: true,
+                    research: None,
+                    tz: jiff::tz::TimeZone::UTC,
+                    workspace: None,
+                    cancel: None,
+                    progress: None,
+                    on_text: None,
+                },
+            )
+            .unwrap();
+            (
+                ok,
+                before,
+                calls.load(Ordering::SeqCst),
+                t.reply,
+                app.backend.caps.read().unwrap().mode,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(ok.0, "known without a probe");
+        assert_eq!(ok.1, 0, "no request before the user's message");
+        assert_eq!(ok.2, 1, "one request for one plain answer");
+        assert!(ok.3.contains("Paris"), "{}", ok.3);
+        assert_eq!(
+            ok.4,
+            crate::model::Mode::Text,
+            "tools as text unless stated"
+        );
+        let (url, calls) = counting_model().await;
+        let probed = tokio::task::spawn_blocking(move || {
+            let app = app_on(&url, true, None);
+            super::ensure_probed(&app);
+            calls.load(Ordering::SeqCst)
+        })
+        .await
+        .unwrap();
+        assert!(
+            probed >= 3,
+            "probing on still tests the model ({probed} requests)"
+        );
+    }
+
+    #[test]
+    fn stated_tools_are_used_without_probing() {
+        let app = app_on("http://127.0.0.1:9", false, Some("native"));
+        assert!(super::ensure_probed(&app));
+        assert_eq!(
+            app.backend.caps.read().unwrap().mode,
+            crate::model::Mode::Native
         );
     }
 }

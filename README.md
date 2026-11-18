@@ -52,6 +52,13 @@ loopback and needs `NEXY_ENGINE_KEY` to listen anywhere else. Without a key it a
 whose `Host` is `127.0.0.1`, `localhost` or `[::1]` on its own port, or a name listed in
 `NEXY_ENGINE_HOSTS` (comma separated); anything else gets `421`, which stops DNS rebinding.
 
+At start the engine tests the model with a few short requests (how to turn thinking off, whether
+tools work natively) and keeps the answer in `caps.json`. For a model that counts every request,
+`NEXY_ENGINE_PROBE=off` skips that test: the abilities come from `NEXY_ENGINE_CAPS_FILE`, or from
+`NEXY_ENGINE_THINK_OFF` (`template_kwargs`, `reasoning_effort`, `both`, `think_false`,
+`no_thinking`, `stays_on`; default `template_kwargs`) and `NEXY_ENGINE_TOOLS` (`native`, `json`,
+`text`; default `text`), and only the user's turns reach the model.
+
 ## API
 
 - `POST /v1/chat/completions`: OpenAI-shaped. The engine keeps each session's history; only the
