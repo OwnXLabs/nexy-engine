@@ -291,7 +291,12 @@ async fn chat(
     let id = format!("chatcmpl-{created}");
     let turn = move |on_text: Option<&dyn Fn(&str)>,
                      progress: Option<&agent::Progress>,
-                     cancel: Option<&AtomicBool>| {
+                     cancel: Option<&AtomicBool>,
+                     route: Option<&(dyn Fn(&str) + Sync)>| {
+        let up = crate::model::Upstream {
+            model: model.as_deref(),
+            route,
+        };
         agent::run(
             &a,
             &bot,
@@ -308,7 +313,7 @@ async fn chat(
                 cancel,
                 progress,
                 on_text,
-                model: model.as_deref(),
+                upstream: Some(&up),
             },
         )
     };
@@ -335,7 +340,14 @@ async fn chat(
             let text = |t: &str| send(sse(&chunk(json!({"content": t}), Value::Null)));
             let progress =
                 |c: &crate::model::RawCall, _: &str| send(format!(": tool {}\n\n", c.name));
-            let (_, finish, extra) = outcome(Ok(turn(Some(&text), Some(&progress), Some(&gone))));
+            // where each model call runs, as the model server says: the client shows it while it waits
+            let route = |on: &str| send(format!(": route {on}\n\n"));
+            let (_, finish, extra) = outcome(Ok(turn(
+                Some(&text),
+                Some(&progress),
+                Some(&gone),
+                Some(&route),
+            )));
             eprintln!(
                 "{}",
                 turn_line(&session, &bot_log, started.elapsed(), finish, &extra)
@@ -362,7 +374,7 @@ async fn chat(
             .into_response();
     }
 
-    let res = tokio::task::spawn_blocking(move || turn(None, None, None)).await;
+    let res = tokio::task::spawn_blocking(move || turn(None, None, None, None)).await;
     let (content, finish, extra) = outcome(res.map_err(|e| e.to_string()));
     eprintln!(
         "{}",
@@ -1281,7 +1293,11 @@ pub(crate) mod tests {
                     .map(|d| serde_json::from_str(d).unwrap())
                     .collect();
                 let text: String = data.iter().filter_map(|v| v["choices"][0]["delta"]["content"].as_str()).collect();
-                Ok((text, data.last().unwrap()["nexy"]["answered_on"].clone()))
+                // said as the call is answered, before the reply: a ": route <where>" comment
+                let route = body.lines().find_map(|l| l.strip_prefix(": route "));
+                let on = data.last().unwrap()["nexy"]["answered_on"].clone();
+                assert_eq!(route, on.as_str(), "{body}");
+                Ok((text, on))
             };
             for stream in [false, true] {
                 let (t, on) = ask(Some("m+own1"), stream).unwrap();

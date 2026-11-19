@@ -488,7 +488,7 @@ pub fn execute(app: &App, job: &Job, tz: TimeZone, event: Option<&str>, title: &
             cancel: None,
             progress: None,
             on_text: None,
-            model: None,
+            upstream: None,
         },
     )
     .map(|t| t.reply);

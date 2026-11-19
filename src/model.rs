@@ -108,8 +108,16 @@ pub struct Req<'a> {
     pub schema: Option<&'a Value>,
     pub max_tokens: u32,
     pub on_text: Option<&'a dyn Sink>,
-    /// a model other than the backend's own, for this call
+    /// a model other than the backend's own, and who hears where each call runs
+    pub upstream: Option<&'a Upstream<'a>>,
+}
+
+/// a turn's own model (one of NEXY_ENGINE_MODEL_ALT) and who hears where each of its calls runs, as
+/// the model server says in x-nexy-answered-on (Nexy Cloud's model network)
+#[derive(Default)]
+pub struct Upstream<'a> {
     pub model: Option<&'a str>,
+    pub route: Option<&'a (dyn Fn(&str) + Sync)>,
 }
 
 pub trait Sink {
@@ -253,6 +261,15 @@ impl Backend {
         }
     }
 
+    /// where the model server ran this call, told to the turn's listener as soon as it is known
+    fn routed(&self, req: &Req, resp: &ureq::Response) -> Option<String> {
+        let on = answered_on(resp);
+        if let (Some(o), Some(f)) = (&on, req.upstream.and_then(|u| u.route)) {
+            f(o);
+        }
+        on
+    }
+
     fn chat_with(&self, req: &Req, caps: &Caps) -> Result<Reply, String> {
         let t0 = Instant::now();
         let mut reply = if caps.ollama {
@@ -267,7 +284,7 @@ impl Backend {
     fn openai_chat(&self, req: &Req, caps: &Caps) -> Result<Reply, String> {
         let think = caps.think_off;
         let mut body = json!({
-            "model": req.model.unwrap_or(&self.model), "messages": req.messages, "max_tokens": caps.max_tokens(req.max_tokens),
+            "model": req.upstream.and_then(|u| u.model).unwrap_or(&self.model), "messages": req.messages, "max_tokens": caps.max_tokens(req.max_tokens),
             "temperature": 0.2, "presence_penalty": 0, "frequency_penalty": 0, "stream": false,
         });
         if matches!(think, ThinkOff::TemplateKwargs | ThinkOff::Both) {
@@ -289,7 +306,7 @@ impl Backend {
             let mut calls: Vec<(String, String)> = Vec::new();
             let end = |v: &Value| !v["choices"][0]["finish_reason"].is_null();
             let resp = self.post("/v1/chat/completions", body)?;
-            r.answered_on = answered_on(&resp);
+            r.answered_on = self.routed(req, &resp);
             lines(resp, end, |v| {
                 if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
                     r.prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
@@ -323,7 +340,7 @@ impl Backend {
             return Ok(r);
         }
         let resp = self.post("/v1/chat/completions", body)?;
-        let on = answered_on(&resp);
+        let on = self.routed(req, &resp);
         let v: Value = resp
             .into_json()
             .map_err(|e| format!("model reply unreadable: {e}"))?;
@@ -348,7 +365,7 @@ impl Backend {
             options["num_ctx"] = json!(caps.num_ctx);
         }
         let mut body = json!({
-            "model": req.model.unwrap_or(&self.model), "messages": ollama_messages(req.messages),
+            "model": req.upstream.and_then(|u| u.model).unwrap_or(&self.model), "messages": ollama_messages(req.messages),
             "options": options, "stream": false,
         });
         match caps.think_off {
@@ -446,7 +463,7 @@ impl Backend {
                 schema: None,
                 max_tokens: 256,
                 on_text: None,
-                model: None,
+                upstream: None,
             },
             caps,
         )
@@ -508,7 +525,7 @@ impl Backend {
                     schema: None,
                     max_tokens: 256,
                     on_text: None,
-                    model: None,
+                    upstream: None,
                 },
                 &caps,
             )
@@ -530,7 +547,7 @@ impl Backend {
                     schema: Some(&schema),
                     max_tokens: 128,
                     on_text: None,
-                    model: None,
+                    upstream: None,
                 },
                 &caps,
             )
@@ -548,7 +565,7 @@ impl Backend {
                 schema: None,
                 max_tokens: 200,
                 on_text: None,
-                model: None,
+                upstream: None,
             },
             &caps,
         ) {

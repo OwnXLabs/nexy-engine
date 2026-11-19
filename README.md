@@ -86,7 +86,8 @@ whose `Host` is `127.0.0.1`, `localhost` or `[::1]` on its own port, or a name l
   back, tool use shows as `: tool <name>` comments, and the last event carries `usage` and `nexy`.
   `"upstream_model"` runs the turn on another model name the server offers in `NEXY_ENGINE_MODEL_ALT`
   (comma separated; any other is `400`). When the model server says where it ran the answer
-  (an `x-nexy-answered-on` header), `nexy.answered_on` carries it.
+  (an `x-nexy-answered-on` header), `nexy.answered_on` carries it, and a streamed reply says it as
+  each model call is answered, in a `: route <where>` comment.
 - `POST /v1/responses` and `GET /v1/uhp`: the [Unified Harness Protocol](https://unifiedharnessprotocol.org)
   (core class, version 2026-10-19). Each bot is a harness.
 - `/api/sessions`, `/api/jobs`: history and scheduled tasks (routines). A schedule is `every 30m`,

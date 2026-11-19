@@ -48,7 +48,7 @@ pub struct Input<'a> {
     pub cancel: Option<&'a AtomicBool>,
     pub progress: Option<&'a Progress<'a>>,
     pub on_text: Option<&'a dyn Fn(&str)>,
-    pub model: Option<&'a str>, // one of NEXY_ENGINE_MODEL_ALT, else the engine's own
+    pub upstream: Option<&'a crate::model::Upstream<'a>>, // the turn's own model, where calls run
 }
 
 fn system_prompt(bot: &Bot, mode: Mode, tools: &[&Tool], tz: &jiff::tz::TimeZone) -> Value {
@@ -264,7 +264,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                 schema: schema.as_ref(),
                 max_tokens: bot.max_tokens,
                 on_text: stream.sink(mode),
-                model: input.model,
+                upstream: input.upstream,
             })
         };
         let reply = match first {
@@ -283,7 +283,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                     schema: None,
                     max_tokens: bot.max_tokens,
                     on_text: stream.sink(mode),
-                    model: input.model,
+                    upstream: input.upstream,
                 })?
             }
             other => other?,
