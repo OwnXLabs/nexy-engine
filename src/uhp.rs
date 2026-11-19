@@ -505,6 +505,7 @@ async fn create(
                 cancel: Some(&t.cancel),
                 progress: Some(&progress),
                 on_text: None,
+                model: None,
             },
         );
         t.finish(res);

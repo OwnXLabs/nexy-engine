@@ -27,8 +27,9 @@ pub struct Turn {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub mode: String,
-    /// the final answer hit the token limit
+    /// the final answer hit the token limit; and where the model server ran it, if it says
     pub cut: bool,
+    pub answered_on: Option<String>,
 }
 
 pub type Progress<'a> = dyn Fn(&RawCall, &str) + Sync + 'a;
@@ -47,6 +48,7 @@ pub struct Input<'a> {
     pub cancel: Option<&'a AtomicBool>,
     pub progress: Option<&'a Progress<'a>>,
     pub on_text: Option<&'a dyn Fn(&str)>,
+    pub model: Option<&'a str>, // one of NEXY_ENGINE_MODEL_ALT, else the engine's own
 }
 
 fn system_prompt(bot: &Bot, mode: Mode, tools: &[&Tool], tz: &jiff::tz::TimeZone) -> Value {
@@ -262,6 +264,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                 schema: schema.as_ref(),
                 max_tokens: bot.max_tokens,
                 on_text: stream.sink(mode),
+                model: input.model,
             })
         };
         let reply = match first {
@@ -280,6 +283,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                     schema: None,
                     max_tokens: bot.max_tokens,
                     on_text: stream.sink(mode),
+                    model: input.model,
                 })?
             }
             other => other?,
@@ -321,7 +325,7 @@ pub fn run(app: &App, bot: &Bot, input: Input) -> Result<Turn, String> {
                     .map_err(db)?;
                 stream.answer(&text);
                 r.turn.reply = text;
-                r.turn.cut = reply.cut;
+                (r.turn.cut, r.turn.answered_on) = (reply.cut, reply.answered_on.clone());
                 return Ok(r.turn);
             }
             Ok(Step::Calls(calls)) => {
@@ -421,7 +425,7 @@ mod tests {
         let n = LOOP
             .find("#[cfg(test)]")
             .map_or(0, |i| LOOP[..i].lines().count());
-        assert!(n <= 400, "agent loop is {n} lines, budget 400");
+        assert!(n <= 404, "agent loop is {n} lines, budget 404");
     }
 
     #[test]

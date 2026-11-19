@@ -1256,6 +1256,7 @@ mod tests {
                     cancel: None,
                     progress: None,
                     on_text: None,
+                    model: None,
                 },
             )
         })
@@ -1328,6 +1329,7 @@ mod tests {
                         cancel: None,
                         progress: None,
                         on_text: None,
+                        model: None,
                     },
                 )
             })

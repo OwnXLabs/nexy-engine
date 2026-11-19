@@ -236,6 +236,7 @@ fn ask(app: &App, args: &[String]) -> i32 {
             cancel: None,
             progress: None,
             on_text: None,
+            model: None,
         },
     ) {
         Ok(t) => {

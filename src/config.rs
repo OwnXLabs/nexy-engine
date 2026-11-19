@@ -7,6 +7,9 @@ pub struct Config {
     pub model_url: String,
     pub model: String,
     pub model_key: Option<String>,
+    /// other model names a turn may ask for (NEXY_ENGINE_MODEL_ALT, comma separated), e.g. a route
+    /// the owner opted into; anything else is refused
+    pub model_alt: Vec<String>,
     pub searxng_url: Option<String>,
     pub data_dir: PathBuf,
     pub packs_dir: PathBuf,
@@ -34,6 +37,14 @@ impl Config {
                 .to_string(),
             model: var("NEXY_ENGINE_MODEL").unwrap_or_else(|| "qwen3.6:35b-a3b".into()),
             model_key: var("NEXY_ENGINE_MODEL_KEY"),
+            model_alt: var("NEXY_ENGINE_MODEL_ALT")
+                .map(|v| {
+                    v.split(',')
+                        .map(|m| m.trim().to_string())
+                        .filter(|m| !m.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             searxng_url: var("NEXY_ENGINE_SEARXNG_URL")
                 .map(|u| u.trim_end_matches('/').to_string()),
             data_dir: var("NEXY_ENGINE_DATA")

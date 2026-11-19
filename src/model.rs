@@ -98,6 +98,8 @@ pub struct Reply {
     pub secs: f64,
     /// the model stopped at its token limit, not at the end of its answer
     pub cut: bool,
+    /// where the model server says it ran the call (x-nexy-answered-on), when it says
+    pub answered_on: Option<String>,
 }
 
 pub struct Req<'a> {
@@ -106,6 +108,8 @@ pub struct Req<'a> {
     pub schema: Option<&'a Value>,
     pub max_tokens: u32,
     pub on_text: Option<&'a dyn Sink>,
+    /// a model other than the backend's own, for this call
+    pub model: Option<&'a str>,
 }
 
 pub trait Sink {
@@ -142,6 +146,14 @@ fn lines(
         return Err("model stream broke: it ended before the answer finished".into());
     }
     Ok(())
+}
+
+/// a short word from the model server's x-nexy-answered-on header ("boost", "own1"), else none
+fn answered_on(resp: &ureq::Response) -> Option<String> {
+    resp.header("x-nexy-answered-on")
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 16 && v.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(String::from)
 }
 
 pub struct Backend {
@@ -255,7 +267,7 @@ impl Backend {
     fn openai_chat(&self, req: &Req, caps: &Caps) -> Result<Reply, String> {
         let think = caps.think_off;
         let mut body = json!({
-            "model": self.model, "messages": req.messages, "max_tokens": caps.max_tokens(req.max_tokens),
+            "model": req.model.unwrap_or(&self.model), "messages": req.messages, "max_tokens": caps.max_tokens(req.max_tokens),
             "temperature": 0.2, "presence_penalty": 0, "frequency_penalty": 0, "stream": false,
         });
         if matches!(think, ThinkOff::TemplateKwargs | ThinkOff::Both) {
@@ -276,7 +288,9 @@ impl Backend {
             let mut r = Reply::default();
             let mut calls: Vec<(String, String)> = Vec::new();
             let end = |v: &Value| !v["choices"][0]["finish_reason"].is_null();
-            lines(self.post("/v1/chat/completions", body)?, end, |v| {
+            let resp = self.post("/v1/chat/completions", body)?;
+            r.answered_on = answered_on(&resp);
+            lines(resp, end, |v| {
                 if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
                     r.prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
                     r.completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
@@ -308,8 +322,9 @@ impl Backend {
                 .collect();
             return Ok(r);
         }
-        let v: Value = self
-            .post("/v1/chat/completions", body)?
+        let resp = self.post("/v1/chat/completions", body)?;
+        let on = answered_on(&resp);
+        let v: Value = resp
             .into_json()
             .map_err(|e| format!("model reply unreadable: {e}"))?;
         let msg = &v["choices"][0]["message"];
@@ -320,6 +335,7 @@ impl Backend {
             completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
             secs: 0.0,
             cut: v["choices"][0]["finish_reason"] == "length",
+            answered_on: on,
         })
     }
 
@@ -332,7 +348,7 @@ impl Backend {
             options["num_ctx"] = json!(caps.num_ctx);
         }
         let mut body = json!({
-            "model": self.model, "messages": ollama_messages(req.messages),
+            "model": req.model.unwrap_or(&self.model), "messages": ollama_messages(req.messages),
             "options": options, "stream": false,
         });
         match caps.think_off {
@@ -385,6 +401,7 @@ impl Backend {
             completion_tokens: v["eval_count"].as_u64().unwrap_or(0),
             secs: 0.0,
             cut: v["done_reason"] == "length",
+            answered_on: None,
         })
     }
 
@@ -429,6 +446,7 @@ impl Backend {
                 schema: None,
                 max_tokens: 256,
                 on_text: None,
+                model: None,
             },
             caps,
         )
@@ -490,6 +508,7 @@ impl Backend {
                     schema: None,
                     max_tokens: 256,
                     on_text: None,
+                    model: None,
                 },
                 &caps,
             )
@@ -511,6 +530,7 @@ impl Backend {
                     schema: Some(&schema),
                     max_tokens: 128,
                     on_text: None,
+                    model: None,
                 },
                 &caps,
             )
@@ -528,6 +548,7 @@ impl Backend {
                 schema: None,
                 max_tokens: 200,
                 on_text: None,
+                model: None,
             },
             &caps,
         ) {

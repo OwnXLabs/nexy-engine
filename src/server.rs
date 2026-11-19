@@ -209,6 +209,9 @@ struct ChatBody {
     /// the owner's zone, e.g. "Asia/Manila": clock times in new routines are read in it
     #[serde(default)]
     tz: Option<String>,
+    /// the model this turn runs on, one of NEXY_ENGINE_MODEL_ALT; absent, the engine's own
+    #[serde(default)]
+    upstream_model: Option<String>,
 }
 
 async fn chat(
@@ -273,6 +276,13 @@ async fn chat(
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
     let outside = context.as_deref().is_some_and(|c| !c.trim().is_empty()) && !body.context_clean;
+    let model = body.upstream_model.filter(|m| !m.is_empty());
+    if model
+        .as_ref()
+        .is_some_and(|m| !app.cfg.model_alt.contains(m))
+    {
+        return err(StatusCode::BAD_REQUEST, "that model is not offered here");
+    }
     let a = app.clone();
     let s2 = session.clone();
     let research = body.research;
@@ -298,6 +308,7 @@ async fn chat(
                 cancel,
                 progress,
                 on_text,
+                model: model.as_deref(),
             },
         )
     };
@@ -369,7 +380,7 @@ fn outcome(res: Result<Result<agent::Turn, String>, String>) -> (String, &'stati
         Ok(Ok(t)) => (
             t.reply.clone(),
             if t.cut { "length" } else { "stop" },
-            json!({"steps": t.steps, "tools": t.tools, "mode": t.mode,
+            json!({"steps": t.steps, "tools": t.tools, "mode": t.mode, "answered_on": t.answered_on,
             "usage": {"prompt_tokens": t.prompt_tokens, "completion_tokens": t.completion_tokens}}),
         ),
         Ok(Err(e)) | Err(e) => (String::new(), "error", json!({"error": e})),
@@ -1203,6 +1214,90 @@ pub(crate) mod tests {
         }
     }
 
+    /// A turn may ask for one of NEXY_ENGINE_MODEL_ALT: the model server gets that name, and where it
+    /// says it ran the answer (x-nexy-answered-on) is reported. Any other name is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_runs_on_an_offered_model_and_says_where() {
+        use axum::routing::post;
+        async fn openai(axum::Json(b): axum::Json<serde_json::Value>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let m = b["model"].as_str().unwrap_or("").to_string();
+            let on = if m == "m+own1" { "own1" } else { "local" };
+            let msg = serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": format!("ran on {m}")}}]});
+            if b["stream"] == true {
+                let c = serde_json::json!({"choices": [{"index": 0, "delta": {"content": format!("ran on {m}")}, "finish_reason": "stop"}]});
+                return (
+                    [("x-nexy-answered-on", on)],
+                    format!("data: {c}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            ([("x-nexy-answered-on", on)], msg.to_string()).into_response()
+        }
+        let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = format!("http://{}", ml.local_addr().unwrap());
+        tokio::spawn(
+            axum::serve(
+                ml,
+                axum::Router::new().route("/v1/chat/completions", post(openai)),
+            )
+            .into_future(),
+        );
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut app = with_bot(test_app(port));
+        app.cfg.model_alt = vec!["m+own1".into()];
+        app.cfg.data_dir = std::env::temp_dir().join(format!("nexy-alt-{}", std::process::id()));
+        app.backend = crate::model::Backend::new(&model, "m", None);
+        *app.backend.caps.write().unwrap() = crate::model::Caps {
+            probed_at: 1,
+            ..Default::default()
+        };
+        let srv =
+            tokio::spawn(axum::serve(l, super::router(std::sync::Arc::new(app))).into_future());
+        let res = tokio::task::spawn_blocking(move || {
+            let ask = |alt: Option<&str>, stream: bool| -> Result<(String, serde_json::Value), u16> {
+                let mut b = serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "stream": stream});
+                if let Some(a) = alt {
+                    b["upstream_model"] = a.into();
+                }
+                let r = ureq::post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                    .send_json(b)
+                    .map_err(|e| match e {
+                        ureq::Error::Status(c, _) => c,
+                        _ => 0,
+                    })?;
+                let body = r.into_string().unwrap();
+                if !stream {
+                    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    return Ok((v["choices"][0]["message"]["content"].as_str().unwrap_or("").into(), v["nexy"]["answered_on"].clone()));
+                }
+                let data: Vec<serde_json::Value> = body
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data: "))
+                    .filter(|d| *d != "[DONE]")
+                    .map(|d| serde_json::from_str(d).unwrap())
+                    .collect();
+                let text: String = data.iter().filter_map(|v| v["choices"][0]["delta"]["content"].as_str()).collect();
+                Ok((text, data.last().unwrap()["nexy"]["answered_on"].clone()))
+            };
+            for stream in [false, true] {
+                let (t, on) = ask(Some("m+own1"), stream).unwrap();
+                assert!(t.contains("ran on m+own1"), "{t}");
+                assert_eq!(on, "own1", "stream={stream}");
+                let (t, on) = ask(None, stream).unwrap();
+                assert!(t.contains("ran on m") && !t.contains("own1"), "{t}");
+                assert_eq!(on, "local");
+                assert_eq!(ask(Some("other"), stream).unwrap_err(), 400, "a model not offered is refused");
+            }
+        })
+        .await;
+        srv.abort();
+        res.unwrap();
+    }
+
     /// QA 0.2.8: a model server killed mid-answer whose stream still ended cleanly. Without the
     /// model's own end marker the turn is a broken one (the owner is offered Continue), never an
     /// answer that looks whole.
@@ -1258,6 +1353,7 @@ pub(crate) mod tests {
                 model_url: "http://127.0.0.1:9".into(),
                 model: "m".into(),
                 model_key: None,
+                model_alt: Vec::new(),
                 searxng_url: None,
                 data_dir: std::env::temp_dir(),
                 packs_dir: std::env::temp_dir(),
