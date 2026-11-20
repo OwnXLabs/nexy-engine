@@ -118,6 +118,14 @@ pub struct Req<'a> {
 pub struct Upstream<'a> {
     pub model: Option<&'a str>,
     pub route: Option<&'a (dyn Fn(&str) + Sync)>,
+    /// Nexy's x-nexy-ticket for this turn, passed on with each model call untouched (Nexy Cloud's
+    /// model network checks it to bill the turn's account; the engine never reads it)
+    pub ticket: Option<&'a str>,
+}
+
+/// A ticket as Nexy may send one: short, and only base64url characters and dots.
+pub fn ticket_ok(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 512 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
 pub trait Sink {
@@ -241,12 +249,19 @@ impl Backend {
     }
 
     fn post(&self, path: &str, body: Value) -> Result<ureq::Response, String> {
+        self.post_with(path, body, None)
+    }
+
+    fn post_with(&self, path: &str, body: Value, ticket: Option<&str>) -> Result<ureq::Response, String> {
         let mut r = self
             .agent
             .post(&format!("{}{path}", self.url))
             .set("content-type", "application/json");
         if let Some(k) = &self.key {
             r = r.set("authorization", &format!("Bearer {k}"));
+        }
+        if let Some(t) = ticket.filter(|t| ticket_ok(t)) {
+            r = r.set("x-nexy-ticket", t);
         }
         match r.send_json(body) {
             Ok(resp) => Ok(resp),
@@ -305,7 +320,7 @@ impl Backend {
             let mut r = Reply::default();
             let mut calls: Vec<(String, String)> = Vec::new();
             let end = |v: &Value| !v["choices"][0]["finish_reason"].is_null();
-            let resp = self.post("/v1/chat/completions", body)?;
+            let resp = self.post_with("/v1/chat/completions", body, req.upstream.and_then(|u| u.ticket))?;
             r.answered_on = self.routed(req, &resp);
             lines(resp, end, |v| {
                 if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
@@ -339,7 +354,7 @@ impl Backend {
                 .collect();
             return Ok(r);
         }
-        let resp = self.post("/v1/chat/completions", body)?;
+        let resp = self.post_with("/v1/chat/completions", body, req.upstream.and_then(|u| u.ticket))?;
         let on = self.routed(req, &resp);
         let v: Value = resp
             .into_json()
@@ -388,7 +403,7 @@ impl Backend {
             body["stream"] = json!(true);
             let mut r = Reply::default();
             lines(
-                self.post("/api/chat", body)?,
+                self.post_with("/api/chat", body, req.upstream.and_then(|u| u.ticket))?,
                 |v| v["done"] == true,
                 |v| {
                     let msg = &v["message"];

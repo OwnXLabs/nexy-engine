@@ -283,6 +283,11 @@ async fn chat(
     {
         return err(StatusCode::BAD_REQUEST, "that model is not offered here");
     }
+    let ticket = headers
+        .get("x-nexy-ticket")
+        .and_then(|v| v.to_str().ok())
+        .filter(|t| crate::model::ticket_ok(t))
+        .map(String::from);
     let a = app.clone();
     let s2 = session.clone();
     let research = body.research;
@@ -296,6 +301,7 @@ async fn chat(
         let up = crate::model::Upstream {
             model: model.as_deref(),
             route,
+            ticket: ticket.as_deref(),
         };
         agent::run(
             &a,
@@ -1224,6 +1230,47 @@ pub(crate) mod tests {
             srv.abort();
             res.unwrap();
         }
+    }
+
+    /// Nexy's x-nexy-ticket reaches every model call of the turn unchanged; a malformed one is dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_turns_ticket_goes_with_its_model_calls() {
+        use axum::routing::post;
+        async fn openai(h: axum::http::HeaderMap) -> String {
+            let t = h.get("x-nexy-ticket").and_then(|v| v.to_str().ok()).unwrap_or("none").to_string();
+            serde_json::json!({"choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": format!("ticket {t}")}}]})
+            .to_string()
+        }
+        let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = format!("http://{}", ml.local_addr().unwrap());
+        tokio::spawn(axum::serve(ml, axum::Router::new().route("/v1/chat/completions", post(openai))).into_future());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut app = with_bot(test_app(port));
+        app.cfg.data_dir = std::env::temp_dir().join(format!("nexy-ticket-{}", std::process::id()));
+        app.backend = crate::model::Backend::new(&model, "m", None);
+        *app.backend.caps.write().unwrap() = crate::model::Caps { probed_at: 1, ..Default::default() };
+        let srv = tokio::spawn(axum::serve(l, super::router(std::sync::Arc::new(app))).into_future());
+        let res = tokio::task::spawn_blocking(move || {
+            let ask = |ticket: Option<&str>| -> String {
+                let mut r = ureq::post(&format!("http://127.0.0.1:{port}/v1/chat/completions"));
+                if let Some(t) = ticket {
+                    r = r.set("x-nexy-ticket", t);
+                }
+                let v: serde_json::Value = serde_json::from_str(
+                    &r.send_json(serde_json::json!({"messages": [{"role": "user", "content": "hi"}]})).unwrap().into_string().unwrap(),
+                )
+                .unwrap();
+                v["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string()
+            };
+            assert_eq!(ask(Some("u01.1763.c2lnbmF0dXJl")), "ticket u01.1763.c2lnbmF0dXJl");
+            assert_eq!(ask(None), "ticket none");
+            assert_eq!(ask(Some("u01 1763;x")), "ticket none", "a malformed ticket is dropped");
+        })
+        .await;
+        srv.abort();
+        res.unwrap();
     }
 
     /// A turn may ask for one of NEXY_ENGINE_MODEL_ALT: the model server gets that name, and where it
